@@ -75,6 +75,7 @@ class TreeNode:
         self.value: Optional[torch.Tensor] = None
         self.mamba_value: Optional[torch.Tensor] = None
         self.mamba_host_value: Optional[torch.Tensor] = None
+        self.mamba_compressed: bool = False
         # invariant: for any node, if mamba_lock_ref is locked, full_lock_ref must be locked;
         # if full_lock_ref is locked, mamba_lock_ref doesn't need to be locked. So,
         # full_lock_ref is always >= mamba_lock_ref.
@@ -441,6 +442,37 @@ class MambaRadixCache(BasePrefixCache):
             self.device = self.token_to_kv_pool_allocator.device
         else:
             self.device = torch.device("cpu")
+
+        # SVD compression config
+        server_args = get_global_server_args()
+        self.enable_svd_compression = getattr(
+            server_args, "mamba_svd_compression", False
+        )
+        self.svd_rank = getattr(server_args, "mamba_svd_rank", 16)
+        if self.enable_svd_compression and self.req_to_token_pool.mamba_pool is not None:
+            temporal_shape = (
+                self.req_to_token_pool.mamba_pool.mamba_cache.temporal.shape
+            )
+            D, S = temporal_shape[-2], temporal_shape[-1]
+            r = self.svd_rank
+            packed_size = r * (D + 1 + S)
+            slot_size = D * S
+            assert packed_size <= slot_size, (
+                f"SVD rank {r} too large: packed U,S,V ({packed_size} elements) "
+                f"exceeds pool slot capacity ({slot_size} elements) for "
+                f"head_dim={D}, state_size={S}. "
+                f"Max rank: {slot_size // (D + 1 + S)}"
+            )
+            logger.info(
+                "SVD compression enabled: rank=%d, head_dim=%d, state_size=%d, "
+                "packed_size=%d/%d (%.1f%%)",
+                r,
+                D,
+                S,
+                packed_size,
+                slot_size,
+                100 * packed_size / slot_size,
+            )
 
         if params.enable_metrics:
             self.init_metrics_collector()
@@ -953,6 +985,90 @@ class MambaRadixCache(BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
+    def _compress_node(self, node: TreeNode) -> bool:
+        """Compress node's temporal state via SVD, packing U,S,V into the pool slot.
+        Returns True on success."""
+        if not self.enable_svd_compression or node.mamba_value is None:
+            return False
+
+        pool = self.req_to_token_pool.mamba_pool
+        slot_idx = node.mamba_value  # [1] tensor
+        rank = self.svd_rank
+
+        # temporal[:, slot_idx] shape: [num_layers, 1, num_heads, head_dim, state_size]
+        state = pool.mamba_cache.temporal[:, slot_idx].squeeze(1)  # [L, H, D, S]
+        orig_device = state.device
+        orig_dtype = state.dtype
+
+        # SVD on CPU float32 (faster than GPU for small matrices)
+        cpu_state = state.detach().cpu().float()
+        q = min(rank + 4, min(cpu_state.shape[-2:]))
+
+        try:
+            u, s, v = torch.svd_lowrank(cpu_state, q=q, niter=1)
+        except Exception as e:
+            logger.warning(
+                "SVD compression failed for pool slot %s, keeping full state: %s",
+                slot_idx,
+                e,
+            )
+            return False  # Keep full state
+
+        u = u[..., :rank]  # [L, H, D, r]
+        s = s[..., :rank]  # [L, H, r]
+        v = v[..., :rank]  # [L, H, S, r]
+
+        # Pack U, S, V into the pool slot
+        # Layout per head: [U flat (D*r) | S flat (r) | V flat (S*r) | zeros]
+        L, H, D, S = cpu_state.shape
+        r = rank
+        packed = torch.zeros_like(cpu_state)  # [L, H, D, S]
+
+        u_flat = u.reshape(L, H, D * r)
+        s_flat = s  # [L, H, r]
+        v_flat = v.reshape(L, H, S * r)
+
+        packed_flat = packed.reshape(L, H, D * S)
+        packed_flat[:, :, : D * r] = u_flat
+        packed_flat[:, :, D * r : D * r + r] = s_flat
+        packed_flat[:, :, D * r + r : D * r + r + S * r] = v_flat
+
+        pool.mamba_cache.temporal[:, slot_idx] = packed.reshape(L, 1, H, D, S).to(
+            device=orig_device, dtype=orig_dtype
+        )
+        node.mamba_compressed = True
+        return True
+
+    def _decompress_from_pool(
+        self, src_node: TreeNode, dst_index: torch.Tensor
+    ) -> None:
+        """Unpack U,S,V from compressed source slot, reconstruct, write to destination slot."""
+        pool = self.req_to_token_pool.mamba_pool
+        rank = self.svd_rank
+        src_idx = src_node.mamba_value
+
+        # Read packed data from source slot
+        packed = pool.mamba_cache.temporal[:, src_idx].squeeze(1)  # [L, H, D, S]
+        L, H, D, S = packed.shape
+        r = rank
+
+        packed_flat = packed.reshape(L, H, D * S)
+        u = packed_flat[:, :, : D * r].reshape(L, H, D, r)
+        s = packed_flat[:, :, D * r : D * r + r]
+        v = packed_flat[:, :, D * r + r : D * r + r + S * r].reshape(L, H, S, r)
+
+        # Reconstruct: (U * S.unsqueeze(-2)) @ V^T → [L, H, D, S]
+        full_state = (u * s.unsqueeze(-2)) @ v.transpose(-2, -1)
+
+        # Write to destination
+        pool.mamba_cache.temporal[:, dst_index] = full_state.unsqueeze(1)
+
+        # Also copy conv states (not compressed)
+        for i in range(len(pool.mamba_cache.conv)):
+            pool.mamba_cache.conv[i][:, dst_index] = pool.mamba_cache.conv[i][
+                :, src_idx
+            ]
+
     def _match_prefix_helper(
         self, key: RadixKey
     ) -> Tuple[List[torch.Tensor], TreeNode, int]:
@@ -1057,13 +1173,21 @@ class MambaRadixCache(BasePrefixCache):
                     dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
                     self.dec_lock_ref(last_node)
                     assert dst_index is not None, "Can not alloc mamba cache"
-                src_index = last_node.mamba_value
-                self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
+                if last_node.mamba_compressed:
+                    self._decompress_from_pool(last_node, dst_index)
+                else:
+                    self.req_to_token_pool.mamba_pool.copy_from(
+                        last_node.mamba_value, dst_index
+                    )
                 req.mamba_pool_idx = dst_index[0]
             else:
-                src_index = last_node.mamba_value
                 dst_index = req.mamba_pool_idx.unsqueeze(0)
-                self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
+                if last_node.mamba_compressed:
+                    self._decompress_from_pool(last_node, dst_index)
+                else:
+                    self.req_to_token_pool.mamba_pool.copy_from(
+                        last_node.mamba_value, dst_index
+                    )
 
         value = value[:best_value_len]
         if value:
@@ -1166,12 +1290,14 @@ class MambaRadixCache(BasePrefixCache):
             node.children[child_key] = new_node
             self.full_evictable_size_ += len(value)
             self.mamba_evictable_size_ += len(mamba_value)
+            self._compress_node(new_node)
         elif node.mamba_value is None:  # add for mamba tombstone
             node.mamba_value = mamba_value
             self.full_lru_list.reset_node_mru(node)
             self.mamba_lru_list.insert_mru(node)
             self.mamba_evictable_size_ += len(mamba_value)
             node.last_access_time = get_last_access_time()
+            self._compress_node(node)
         else:  # mamba value already exists
             mamba_value_exist = True
             self.full_lru_list.reset_node_mru(node)
@@ -1219,6 +1345,7 @@ class MambaRadixCache(BasePrefixCache):
         assert len(node.children) != 0, f"Cannot tombstone a leaf node, {node.id=}"
         self.mamba_evictable_size_ -= len(node.mamba_value)
         node.mamba_value = None
+        node.mamba_compressed = False
 
     def _delete_tombstone_leaf(self, node: TreeNode) -> None:
         assert (

@@ -545,6 +545,8 @@ class ServerArgs:
 
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
+    mamba_svd_compression: bool = False
+    mamba_svd_rank: int = 16
     mamba_ssm_dtype: Optional[str] = None
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
@@ -5036,6 +5038,18 @@ class ServerArgs:
         )
 
         # Mamba Cache
+        parser.add_argument(
+            "--mamba-svd-compression",
+            action="store_true",
+            default=ServerArgs.mamba_svd_compression,
+            help="Compress mamba temporal states via low-rank SVD in the prefix cache.",
+        )
+        parser.add_argument(
+            "--mamba-svd-rank",
+            type=int,
+            default=ServerArgs.mamba_svd_rank,
+            help="Target rank for SVD compression of mamba temporal states.",
+        )
         parser.add_argument(
             "--max-mamba-cache-size",
             type=int,
