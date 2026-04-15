@@ -2303,6 +2303,8 @@ class Scheduler(
 
         if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()
+        if hasattr(self.tree_cache, "drain_compression_completions"):
+            self.tree_cache.drain_compression_completions()
 
         if self.enable_priority_preemption:
             # Reset batch_is_full to try preemption with a prefill adder.

@@ -1,3 +1,4 @@
+import time
 import unittest
 
 import torch
@@ -12,7 +13,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache, TreeNode
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -146,12 +147,31 @@ class TestMambaSVDCompression(unittest.TestCase):
         )
         return tree
 
+    def _drain_sync(self, tree, timeout_s: float = 5.0):
+        """Wait for the async SVD worker to drain its work queue, then commit completions
+        on the main thread. No-op if compression is disabled."""
+        if not getattr(tree, "enable_svd_compression", False):
+            return
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if (
+                tree._compression_queue.empty()
+                and not tree._pending_compression
+                and tree._compression_done_queue.empty()
+            ):
+                return
+            if not tree._compression_done_queue.empty():
+                tree.drain_compression_completions()
+            else:
+                time.sleep(0.01)
+        tree.drain_compression_completions()
+
     def _req(self):
         req = _make_req(self.req_to_token_pool)
         self._tracked_reqs.append(req)
         return req
 
-    def test_compression_flag_set_after_insert(self):
+    def test_compression_flag_set_after_drain(self):
         tree = self._fresh_tree(svd_compression=True)
         req = self._req()
         _write_known_state(self.req_to_token_pool.mamba_pool, req.mamba_pool_idx)
@@ -165,8 +185,18 @@ class TestMambaSVDCompression(unittest.TestCase):
         )
 
         node = tree.root_node.children[1]
-        self.assertTrue(node.mamba_compressed, "Node should be compressed after insert")
-        self.assertIsNotNone(node.mamba_value, "Pool slot should still be allocated")
+        # Async: right after insert the node is still full-rank.
+        self.assertFalse(node.mamba_compressed)
+        self.assertIsNotNone(node.mamba_value)
+
+        self._drain_sync(tree)
+
+        # After the worker runs and the drain commits, the node lives in the
+        # compressed pool: full slot freed, compressed_slot set, flag flipped.
+        self.assertTrue(node.mamba_compressed, "Node should be compressed after drain")
+        self.assertIsNone(node.mamba_value, "Full-rank slot should be freed")
+        self.assertIsNotNone(node.compressed_slot)
+        self.assertIn(node.id, tree._compressed_lru)
 
     def test_compression_disabled(self):
         tree = self._fresh_tree(svd_compression=False)
@@ -196,6 +226,13 @@ class TestMambaSVDCompression(unittest.TestCase):
                 value=self.allocator.alloc(3),
                 mamba_value=req1.mamba_pool_idx.unsqueeze(0),
             )
+        )
+
+        # Force the async worker to finish + commit before we probe the compressed path.
+        self._drain_sync(tree)
+        node = tree.root_node.children[1]
+        self.assertTrue(
+            node.mamba_compressed, "Node must be compressed for this test to exercise SVD"
         )
 
         req2 = self._req()
@@ -235,6 +272,7 @@ class TestMambaSVDCompression(unittest.TestCase):
                 mamba_value=req1.mamba_pool_idx.unsqueeze(0),
             )
         )
+        self._drain_sync(tree)
 
         req2 = self._req()
         tree.match_prefix(
@@ -294,16 +332,20 @@ class TestMambaSVDCompression(unittest.TestCase):
                 mamba_value=req2.mamba_pool_idx.unsqueeze(0),
             )
         )
+        self._drain_sync(tree)
 
         internal = tree.root_node.children[1]
+        # With Option A, compressed nodes live in _compressed_lru instead of
+        # mamba_lru_list, so evict_mamba can no longer reach this internal.
+        # Verify it *is* compressed and remains so after evict_mamba runs.
         self.assertTrue(internal.mamba_compressed)
+        self.assertIn(internal.id, tree._compressed_lru)
 
         tree.evict(EvictParams(num_tokens=0, mamba_num=1))
 
-        if internal.mamba_value is None:
-            self.assertFalse(
-                internal.mamba_compressed, "Tombstoned node flag should be False"
-            )
+        # evict_mamba only walks mamba_lru_list → cannot see compressed nodes.
+        # The internal stays compressed.
+        self.assertTrue(internal.mamba_compressed)
 
     def test_split_preserves_child_flag(self):
         tree = self._fresh_tree(svd_compression=True)
@@ -316,6 +358,7 @@ class TestMambaSVDCompression(unittest.TestCase):
                 mamba_value=req1.mamba_pool_idx.unsqueeze(0),
             )
         )
+        self._drain_sync(tree)  # child must be compressed before the split happens
 
         req2 = self._req()
         tree.insert(
@@ -325,6 +368,7 @@ class TestMambaSVDCompression(unittest.TestCase):
                 mamba_value=req2.mamba_pool_idx.unsqueeze(0),
             )
         )
+        self._drain_sync(tree)
 
         parent = tree.root_node.children[1]
         self.assertIsNone(parent.mamba_value, "Split parent should be tombstone")
@@ -334,6 +378,8 @@ class TestMambaSVDCompression(unittest.TestCase):
         self.assertTrue(
             child_45.mamba_compressed, "Child should keep compressed flag after split"
         )
+        # The child should still be findable in the compressed LRU list.
+        self.assertIn(child_45.id, tree._compressed_lru)
 
         tree.sanity_check()
 
@@ -342,6 +388,126 @@ class TestMambaSVDCompression(unittest.TestCase):
         with self.assertRaises(AssertionError) as ctx:
             self._fresh_tree(svd_compression=True, svd_rank=100)
         self.assertIn("too large", str(ctx.exception))
+
+    def test_pack_unpack_roundtrip_async(self):
+        """End-to-end check of the async packing path.
+
+        Forces a compression + commit, then verifies that:
+          1. the full-rank pool slot is freed (pool available_size increased by 1),
+          2. a compressed slot is allocated,
+          3. _decompress_from_pool reads back a tensor whose reconstruction error
+             against the *original* known-rank-2 state is within tolerance.
+
+        This is the single check that catches a layout mismatch between the
+        worker's ``torch.cat([u, s, v])`` pack and ``_decompress_from_pool``'s
+        offset-based unpack — silent corruption would show up here as a huge
+        relative error while the compressed path is clearly live.
+        """
+        tree = self._fresh_tree(svd_compression=True, svd_rank=4)
+        mamba_pool = self.req_to_token_pool.mamba_pool
+
+        req = self._req()
+        original_state = _write_known_state(mamba_pool, req.mamba_pool_idx)
+
+        avail_before = mamba_pool.available_size()
+        tree.insert(
+            InsertParams(
+                key=RadixKey([7, 8, 9]),
+                value=self.allocator.alloc(3),
+                mamba_value=req.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+        self._drain_sync(tree)
+
+        node = tree.root_node.children[7]
+        self.assertTrue(node.mamba_compressed, "Drain must flip mamba_compressed")
+        self.assertIsNone(node.mamba_value, "Drain must free the full-rank slot")
+        self.assertIsNotNone(node.compressed_slot)
+
+        # The full-rank slot for the compressed node was freed during drain.
+        # The pool had exactly +1 slot returned relative to before drain.
+        avail_after = mamba_pool.available_size()
+        self.assertEqual(
+            avail_after,
+            avail_before + 1,
+            f"Exactly one full-rank slot should be freed: before={avail_before}, after={avail_after}",
+        )
+
+        # Reconstruct into a scratch slot and compare to the original.
+        dst_scratch = mamba_pool.alloc(1)
+        self.assertIsNotNone(dst_scratch)
+        tree._decompress_from_pool(node, dst_scratch)
+
+        # temporal[:, slot_tensor] is [L, 1, H, D, S]; squeeze the slot dim so the
+        # subtraction against [L, H, D, S] original doesn't trigger a bad broadcast.
+        reconstructed = mamba_pool.mamba_cache.temporal[:, dst_scratch].squeeze(1)
+        relative_error = torch.norm(
+            original_state.float() - reconstructed.float()
+        ) / (torch.norm(original_state.float()) + 1e-8)
+        self.assertLess(
+            relative_error.item(),
+            0.1,
+            f"Pack/unpack relative error too high: {relative_error:.6f}",
+        )
+        mamba_pool.free(dst_scratch)
+
+    def test_free_mamba_state_dispatch(self):
+        """Unit-ish test of the _free_mamba_state dispatcher for the three node states."""
+        tree = self._fresh_tree(svd_compression=True)
+        mamba_pool = self.req_to_token_pool.mamba_pool
+
+        # --- Case 1: full-rank node -> pool.free() branch.
+        req_a = self._req()
+        full_slot = req_a.mamba_pool_idx.unsqueeze(0).clone()
+        avail_before = mamba_pool.available_size()
+
+        node_full = TreeNode()
+        node_full.mamba_value = full_slot
+        node_full.mamba_compressed = False
+        tree._free_mamba_state(node_full)
+
+        self.assertIsNone(node_full.mamba_value, "full-rank branch should clear mamba_value")
+        self.assertFalse(node_full.mamba_compressed)
+        self.assertEqual(
+            mamba_pool.available_size(),
+            avail_before + 1,
+            "free_mamba_state must return the full-rank slot to the pool",
+        )
+
+        # --- Case 2: compressed node -> compressed-pool branch.
+        free_slots_before = len(tree._compressed_free_slots)
+        node_compressed = TreeNode()
+        node_compressed.mamba_value = None
+        node_compressed.mamba_compressed = True
+        node_compressed.compressed_slot = tree._compressed_free_slots.pop()
+        tree._compressed_lru[node_compressed.id] = node_compressed
+
+        tree._free_mamba_state(node_compressed)
+
+        self.assertFalse(node_compressed.mamba_compressed)
+        self.assertIsNone(node_compressed.compressed_slot)
+        self.assertNotIn(node_compressed.id, tree._compressed_lru)
+        self.assertEqual(
+            len(tree._compressed_free_slots),
+            free_slots_before,
+            "Compressed slot should have been returned to the free list",
+        )
+
+        # --- Case 3: empty node (no mamba state at all) -> idempotent no-op.
+        node_empty = TreeNode()
+        node_empty.mamba_value = None
+        node_empty.mamba_compressed = False
+        pre_free_slots = len(tree._compressed_free_slots)
+        pre_pool_avail = mamba_pool.available_size()
+
+        tree._free_mamba_state(node_empty)  # should not raise, should not mutate pools
+
+        self.assertEqual(len(tree._compressed_free_slots), pre_free_slots)
+        self.assertEqual(mamba_pool.available_size(), pre_pool_avail)
+
+        # --- Case 4: idempotency — freeing an already-freed compressed node must be safe.
+        tree._free_mamba_state(node_compressed)
+        self.assertFalse(node_compressed.mamba_compressed)
 
     def test_sanity_check_integration(self):
         tree = self._fresh_tree(svd_compression=True)
