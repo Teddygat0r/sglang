@@ -875,6 +875,12 @@ class MambaRadixCache(BasePrefixCache):
                 self.mamba_evictable_size_ -= len(node.mamba_value)
                 self.mamba_protected_size_ += len(node.mamba_value)
             node.mamba_lock_ref += 1
+        elif node.mamba_compressed:
+            # Compressed nodes don't contribute to mamba_evictable_size_ /
+            # mamba_protected_size_ (those count the full mamba pool only),
+            # but we still track mamba_lock_ref so _evict_compressed_lru skips
+            # in-use entries.
+            node.mamba_lock_ref += 1
 
         while node != self.root_node:
             # lock full from node to root
@@ -907,6 +913,14 @@ class MambaRadixCache(BasePrefixCache):
                 self.mamba_evictable_size_ += len(node.mamba_value)
                 self.mamba_protected_size_ -= len(node.mamba_value)
             node.mamba_lock_ref -= 1
+        elif node.mamba_compressed:
+            # Mirror of inc_lock_ref's compressed branch. Counter adjustments
+            # already happened at drain commit (mamba_protected_size_ -= 1 for
+            # locked-at-commit, mamba_evictable_size_ -= 1 for unlocked); here
+            # we just decrement the lock ref. Tolerate mamba_lock_ref == 0 to
+            # match the existing code style for skipped branches.
+            if node.mamba_lock_ref > 0:
+                node.mamba_lock_ref -= 1
 
         while node != self.root_node:
             assert (
@@ -1154,8 +1168,10 @@ class MambaRadixCache(BasePrefixCache):
                 continue
             if node.mamba_value is None or node.mamba_compressed:
                 continue  # evicted or already committed — discard
-            if node.mamba_lock_ref > 0:
-                continue  # in-use — discard; we don't re-enqueue in the prototype
+            # NOTE: committing while locked (mamba_lock_ref > 0) is safe. The
+            # tree's node.mamba_value is a fork separate from req.mamba_pool_idx,
+            # so freeing it does not disturb the running request's working slot.
+            # The scheduler is single-threaded, so no concurrent read race.
             if not self._compressed_free_slots:
                 if not self._evict_compressed_lru():
                     continue  # every compressed entry is locked — drop
@@ -1177,17 +1193,23 @@ class MambaRadixCache(BasePrefixCache):
             # (the list's assertions require mamba_value to still be non-None).
             if self.mamba_lru_list.in_list(node):
                 self.mamba_lru_list.remove_node(node)
-            # The node no longer occupies a slot in the full mamba pool. The
-            # mamba_evictable_size_ counter tracks full-pool evictable only, so
-            # hand its contribution off before we flip state.
-            self.mamba_evictable_size_ -= len(full_slot)
-            # 3. Free the full-rank slot.
+            # 3. Hand off the node's contribution from the full-pool counters.
+            # A locked full-rank node lives in mamba_protected_size_; an
+            # unlocked one in mamba_evictable_size_. Dispatch based on the
+            # current lock state. After commit, neither counter tracks this
+            # node (compressed pool has its own bookkeeping).
+            if node.mamba_lock_ref > 0:
+                self.mamba_protected_size_ -= len(full_slot)
+            else:
+                self.mamba_evictable_size_ -= len(full_slot)
+            # 4. Free the full-rank slot.
             pool.free(full_slot)
-            # 4. Atomic state swap — single-writer (scheduler) thread, no lock.
+            # 5. Atomic state swap — single-writer (scheduler) thread, no lock.
             node.mamba_value = None
             node.compressed_slot = c_slot
             node.mamba_compressed = True
-            # 5. Insert into compressed LRU at MRU end.
+            # 6. Insert into compressed LRU. Locked compressed nodes stay in
+            # the list; _evict_compressed_lru skips them.
             self._compressed_lru[node.id] = node
 
     def _evict_compressed_lru(self) -> bool:

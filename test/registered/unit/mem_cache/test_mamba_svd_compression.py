@@ -198,6 +198,68 @@ class TestMambaSVDCompression(unittest.TestCase):
         self.assertIsNotNone(node.compressed_slot)
         self.assertIn(node.id, tree._compressed_lru)
 
+    def test_compression_commits_while_locked(self):
+        """Reproduction for the scheduler path: insert then inc_lock_ref *before*
+        drain fires. The scheduler's cache_unfinished_req flow always inserts and
+        then immediately locks the new last_node (mamba_lock_ref=1) as part of
+        prepping the request for decode. If drain treats a locked node as
+        'in-use' and drops the completion, compression NEVER happens in
+        production — even though the unit tests above all pass because they
+        never touch inc_lock_ref.
+
+        This test pins the required behavior: committing a compressed slot for
+        a locked node must succeed, and counter accounting must stay balanced.
+        """
+        tree = self._fresh_tree(svd_compression=True)
+        req = self._req()
+        _write_known_state(self.req_to_token_pool.mamba_pool, req.mamba_pool_idx)
+
+        tree.insert(
+            InsertParams(
+                key=RadixKey([21, 22, 23]),
+                value=self.allocator.alloc(3),
+                mamba_value=req.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+        node = tree.root_node.children[21]
+
+        # Simulate cache_unfinished_req: lock the node *before* the worker has
+        # finished + drained. This is the exact sequencing that blocks production
+        # compression today.
+        tree.inc_lock_ref(node)
+        self.assertEqual(node.mamba_lock_ref, 1)
+        pre_protected = tree.mamba_protected_size_
+        pre_evictable = tree.mamba_evictable_size_
+
+        self._drain_sync(tree)
+
+        self.assertTrue(
+            node.mamba_compressed,
+            "Drain must commit compression even when the node is locked",
+        )
+        self.assertIsNone(node.mamba_value)
+        self.assertIsNotNone(node.compressed_slot)
+        self.assertIn(node.id, tree._compressed_lru)
+
+        # Accounting: mamba_protected_size_ should have dropped by 1 (the slot
+        # that was locked is no longer in the full pool). Evictable unchanged.
+        self.assertEqual(tree.mamba_protected_size_, pre_protected - 1)
+        self.assertEqual(tree.mamba_evictable_size_, pre_evictable)
+
+        # Releasing the lock on a compressed node must not underflow anything.
+        tree.dec_lock_ref(node)
+        self.assertEqual(node.mamba_lock_ref, 0)
+        self.assertEqual(tree.mamba_protected_size_, pre_protected - 1)
+        self.assertEqual(tree.mamba_evictable_size_, pre_evictable)
+
+        # Subsequent inc/dec on a compressed node is also safe.
+        tree.inc_lock_ref(node)
+        self.assertEqual(node.mamba_lock_ref, 1)
+        tree.dec_lock_ref(node)
+        self.assertEqual(node.mamba_lock_ref, 0)
+        self.assertEqual(tree.mamba_protected_size_, pre_protected - 1)
+        self.assertEqual(tree.mamba_evictable_size_, pre_evictable)
+
     def test_compression_disabled(self):
         tree = self._fresh_tree(svd_compression=False)
         req = self._req()
