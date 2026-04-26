@@ -455,39 +455,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
         return projected_states_qkvz, projected_states_ba
 
-    def _maybe_apply_svd_to_ssm_state(self, forward_batch: ForwardBatch) -> None:
-        # Skip during CUDA-graph capture — this path does a GPU->CPU->GPU SVD
-        # that can't be captured. The outer model's `needs_eager_forward` hook
-        # pre-computes which requests trigger this step and stashes the mask on
-        # `forward_batch.gdn_svd_trigger_mask`; we just apply it.
-        if get_is_capture_mode():
-            return
-        mask = getattr(forward_batch, "gdn_svd_trigger_mask", None)
-        if mask is None:
-            return
-        attn_backend = getattr(forward_batch, "attn_backend", None)
-        linear_backend = getattr(attn_backend, "linear_attn_backend", None)
-        if linear_backend is None:
-            return
-        metadata = getattr(linear_backend, "forward_metadata", None)
-        pool = getattr(linear_backend, "req_to_token_pool", None)
-        if metadata is None or pool is None:
-            return
-        cache_indices = getattr(metadata, "mamba_cache_indices", None)
-        if cache_indices is None or cache_indices.numel() == 0:
-            return
-
-        bs = mask.shape[0]
-        cache_indices = cache_indices[:bs]
-        selected = cache_indices[mask.to(cache_indices.device)]
-        if selected.numel() == 0:
-            return
-
-        layer_cache = pool.mamba2_layer_cache(self.attn.layer_id)
-        temporal = layer_cache.temporal
-        rows = temporal[selected]
-        temporal[selected] = low_rank_svd(rows, n=16)
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -537,8 +504,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             a=a,
             b=b,
         )
-
-        self._maybe_apply_svd_to_ssm_state(forward_batch)
 
         z_shape_og = z.shape
         # reshape input data into 2D tensor
@@ -1077,6 +1042,57 @@ class Qwen3_5ForCausalLM(nn.Module):
         forward_batch.gdn_svd_trigger_mask = mask
         return True
 
+    def _apply_svd_to_ssm_state(self, forward_batch: ForwardBatch) -> None:
+        # Single batched compaction across all GDN layers on this PP rank: gather
+        # `temporal[selected]` from each layer, stack into one tensor, run a single
+        # `low_rank_svd`, and scatter back. This collapses N host syncs (one CPU
+        # round-trip per GDN layer) into 1 per fire.
+        if get_is_capture_mode():
+            return
+        mask = getattr(forward_batch, "gdn_svd_trigger_mask", None)
+        if mask is None:
+            return
+        attn_backend = getattr(forward_batch, "attn_backend", None)
+        linear_backend = getattr(attn_backend, "linear_attn_backend", None)
+        if linear_backend is None:
+            return
+        metadata = getattr(linear_backend, "forward_metadata", None)
+        pool = getattr(linear_backend, "req_to_token_pool", None)
+        if metadata is None or pool is None:
+            return
+        cache_indices = getattr(metadata, "mamba_cache_indices", None)
+        if cache_indices is None or cache_indices.numel() == 0:
+            return
+
+        bs = mask.shape[0]
+        cache_indices = cache_indices[:bs]
+        selected = cache_indices[mask.to(cache_indices.device)]
+        if selected.numel() == 0:
+            return
+
+        gdn_layer_caches = []
+        for layer_idx in range(self.start_layer, self.end_layer):
+            layer = self.layers[layer_idx]
+            if isinstance(layer, Qwen3_5LinearDecoderLayer):
+                gdn_layer_caches.append(
+                    pool.mamba2_layer_cache(layer.linear_attn.attn.layer_id)
+                )
+        if not gdn_layer_caches:
+            return
+
+        stacked = torch.stack(
+            [lc.temporal[selected] for lc in gdn_layer_caches], dim=0
+        )
+        logger.info(
+            "GDN SVD compaction firing: %d req(s), %d GDN layer(s), stacked shape %s",
+            int(selected.numel()),
+            len(gdn_layer_caches),
+            tuple(stacked.shape),
+        )
+        compressed = low_rank_svd(stacked, n=16)
+        for i, lc in enumerate(gdn_layer_caches):
+            lc.temporal[selected] = compressed[i]
+
     @property
     def start_layer(self) -> int:
         return self._start_layer
@@ -1130,6 +1146,8 @@ class Qwen3_5ForCausalLM(nn.Module):
                 hidden_states.add_(
                     input_deepstack_embeds[:, sep : sep + self.hidden_size]
                 )
+
+        self._apply_svd_to_ssm_state(forward_batch)
 
         # Return intermediate tensors for pipeline parallelism
         if not self.pp_group.is_last_rank:
