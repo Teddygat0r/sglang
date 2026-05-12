@@ -94,6 +94,7 @@ from sglang.srt.utils import (
     set_weight_attrs,
 )
 from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
+from sglang.srt.utils.rsvd_eigh_mp import low_rank_svd
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
@@ -104,33 +105,6 @@ _is_amx_available = cpu_has_amx_support()
 
 
 cached_get_processor = lru_cache(get_processor)
-
-def low_rank_svd(tensor: torch.Tensor, n: int = 16, oversample: int = 4, niter: int = 1):
-    if tensor.dim() < 2:
-        raise ValueError(f"SVD expects tensor rank >= 2, got shape {tuple(tensor.shape)}")
-    orig_device = tensor.device
-    orig_dtype = tensor.dtype
-
-    cpu_tensor = tensor.detach().to(device="cpu", dtype=torch.float32)
-    q = min(n + oversample, min(cpu_tensor.shape[-2:]))
-
-    try:
-        u, s, v = torch.svd_lowrank(cpu_tensor, q=q, niter=niter)
-    except RuntimeError as e:
-        flat = cpu_tensor.reshape((-1, cpu_tensor.shape[-2], cpu_tensor.shape[-1]))
-        for i in range(flat.shape[0]):
-            try:
-                u, s, v = torch.svd_lowrank(flat[i], q=q, niter=niter)
-            except RuntimeError as e:
-                with open("svd_error.log", "a") as f:
-                    f.write(f"SVD error: {e}\n")
-                    f.write(f"tensor[{i}] = {flat[i]}\n")
-        return tensor
-
-    u, s, v = u[..., :n], s[..., :n], v[..., :n]
-    approx_cpu = (u * s.unsqueeze(-2)) @ v.transpose(-2, -1)
-    return approx_cpu.to(device=orig_device, dtype=orig_dtype)
-
 
 # Decode-side cadence for the GDN SSM-state SVD pass: run every N generated tokens
 # after the end-of-prefill fire.

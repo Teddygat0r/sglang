@@ -59,6 +59,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -75,6 +76,7 @@ from sglang.srt.utils import (
     make_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.rsvd_eigh_mp import low_rank_svd
 from sglang.utils import logger
 
 _is_cuda = is_cuda()
@@ -559,6 +561,11 @@ ALL_DECODER_LAYER_TYPES: dict[str, type] = {
 }
 
 
+# Decode-side cadence for the Mamba SSM-state SVD pass: run every N generated tokens
+# after the end-of-prefill fire.
+_SSM_SVD_DECODE_PERIOD = 1024
+
+
 class NemotronHModel(nn.Module):
     def __init__(
         self,
@@ -605,6 +612,109 @@ class NemotronHModel(nn.Module):
         else:
             self.norm_f = PPMissingLayer(return_tuple=True)
 
+        # Per-request baseline for the Mamba SVD cadence: keys are req_pool_idx,
+        # values are the seq_len at which this request's SSM state was last
+        # SVD-approximated. Missing key means "fire at next decode step" (i.e.
+        # immediately post-prefill).
+        self._ssm_svd_baseline: dict = {}
+
+    def _compute_svd_trigger_mask(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[torch.Tensor]:
+        mode = forward_batch.forward_mode
+        req_pool_indices = forward_batch.req_pool_indices
+        if req_pool_indices is None:
+            return None
+        bs = forward_batch.batch_size
+        req_slots = req_pool_indices[:bs].tolist()
+
+        is_mixed = mode.is_mixed()
+        # Pure extend: every request in the batch is extending, so clear their
+        # baselines and let the next decode step fire once post-prefill.
+        if mode.is_extend() and not is_mixed:
+            for req_slot in req_slots:
+                self._ssm_svd_baseline.pop(int(req_slot), None)
+            return None
+
+        if not (mode.is_decode() or is_mixed):
+            return None
+
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if seq_lens_cpu is None:
+            return None
+        seq_lens = seq_lens_cpu[:bs].tolist()
+
+        ext_lens = forward_batch.extend_seq_lens_cpu if is_mixed else None
+
+        mask = torch.zeros(bs, dtype=torch.bool)
+        for i, req_slot in enumerate(req_slots):
+            req_slot = int(req_slot)
+            if ext_lens is not None and ext_lens[i] > 1:
+                self._ssm_svd_baseline.pop(req_slot, None)
+                continue
+            seq_len = int(seq_lens[i])
+            baseline = self._ssm_svd_baseline.get(req_slot)
+            if baseline is None or seq_len - baseline >= _SSM_SVD_DECODE_PERIOD:
+                mask[i] = True
+                self._ssm_svd_baseline[req_slot] = seq_len
+        return mask
+
+    def needs_eager_forward(self, forward_batch: ForwardBatch) -> bool:
+        mask = self._compute_svd_trigger_mask(forward_batch)
+        if mask is None or not bool(mask.any().item()):
+            return False
+        forward_batch.mamba_svd_trigger_mask = mask
+        return True
+
+    def _apply_svd_to_ssm_state(self, forward_batch: ForwardBatch) -> None:
+        # Single batched compaction across all Mamba layers on this PP rank:
+        # gather `temporal[selected]` from each layer, stack, run a single
+        # `low_rank_svd`, and scatter back. This collapses N host syncs (one
+        # round-trip per Mamba layer) into 1 per fire.
+        if get_is_capture_mode():
+            return
+        mask = getattr(forward_batch, "mamba_svd_trigger_mask", None)
+        if mask is None:
+            return
+        attn_backend = getattr(forward_batch, "attn_backend", None)
+        linear_backend = getattr(attn_backend, "linear_attn_backend", None)
+        if linear_backend is None:
+            return
+        metadata = getattr(linear_backend, "forward_metadata", None)
+        pool = getattr(linear_backend, "req_to_token_pool", None)
+        if metadata is None or pool is None:
+            return
+        cache_indices = getattr(metadata, "mamba_cache_indices", None)
+        if cache_indices is None or cache_indices.numel() == 0:
+            return
+
+        bs = mask.shape[0]
+        cache_indices = cache_indices[:bs]
+        selected = cache_indices[mask.to(cache_indices.device)]
+        if selected.numel() == 0:
+            return
+
+        mamba_layer_caches = []
+        for layer_idx in range(self.start_layer, self.end_layer):
+            layer = self.layers[layer_idx]
+            if isinstance(layer, NemotronHMambaDecoderLayer):
+                mamba_layer_caches.append(pool.mamba2_layer_cache(layer.layer_id))
+        if not mamba_layer_caches:
+            return
+
+        stacked = torch.stack(
+            [lc.temporal[selected] for lc in mamba_layer_caches], dim=0
+        )
+        logger.info(
+            "Mamba SVD compaction firing: %d req(s), %d Mamba layer(s), stacked shape %s",
+            int(selected.numel()),
+            len(mamba_layer_caches),
+            tuple(stacked.shape),
+        )
+        compressed = low_rank_svd(stacked, n=16)
+        for i, lc in enumerate(mamba_layer_caches):
+            lc.temporal[selected] = compressed[i]
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -633,6 +743,8 @@ class NemotronHModel(nn.Module):
                 residual=residual,
                 forward_batch=forward_batch,
             )
+
+        self._apply_svd_to_ssm_state(forward_batch)
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -734,6 +846,12 @@ class NemotronHForCausalLM(nn.Module):
 
     def get_input_embeddings(self) -> VocabParallelEmbedding:
         return self.model.embed_tokens
+
+    def needs_eager_forward(self, forward_batch: ForwardBatch) -> bool:
+        inner = getattr(self, "model", None)
+        if inner is None or not hasattr(inner, "needs_eager_forward"):
+            return False
+        return inner.needs_eager_forward(forward_batch)
 
     @torch.no_grad()
     def forward(
