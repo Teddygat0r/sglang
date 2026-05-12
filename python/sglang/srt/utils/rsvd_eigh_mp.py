@@ -1,18 +1,22 @@
 """
 Fast batched randomized SVD via eigh-on-Gram + mixed-precision Cholesky-QR.
 
-This is a minimal, single-path variant of `rsvd_eigh.py` that hard-codes the
-`chol_mp` orthonormalization: a single Cholesky-QR sweep performed in fp64.
+Minimal, single-path variant of `rsvd_eigh.py` that uses fp64 Cholesky-QR
+for orthonormalization, with a Householder-QR fallback for inputs that are
+exactly rank-deficient at `q = rank + oversample`.
+
 On ill-conditioned but full-rank inputs (decaying spectra, ML activations,
-KV-cache states), this lands at fp32-machine-epsilon orthonormality and
-the rank-k truncation optimum, without the systematic accuracy bias of the
-jitter-ladder paths (`chol_v6`) or the slow Householder fallback path of
-`cholqr2` on these inputs.
+KV-cache states), the fp64 CholQR path lands at fp32-machine-epsilon
+orthonormality and the rank-k truncation optimum — no jitter bias, no slow
+Householder for the common case. On rank-deficient inputs (`σ_q = 0` to
+fp64 precision), the fallback handles correctness at the standard
+Householder cost.
 
 Algorithm (one call):
   Omega ~ N(0, 1) of shape [..., n, q] where q = rank + oversample.
   Y = A · Omega                       sketch the column space
-  Q = chol_mp(Y)                      fp64 CholQR → fp32 Q
+  Q = chol_mp(Y)                      fp64 CholQR → fp32 Q  (Householder
+                                       fallback on LinAlgError)
   repeat n_iter times:
       Y = A · (Aᵀ · Q)                power iteration
       Q = chol_mp(Y)
@@ -33,17 +37,23 @@ Why this path:
     state batch ([768, 128, 128] → rank 16), single-pass fp32 CholQR fails
     on ~30% of states; fp32 with jitter ladder works but biases the recon
     by ~1pp; fp64 single-pass succeeds with no bias.
-  - No fallback path: on the workloads this is designed for, the fp64
-    Cholesky succeeds (the matrix is mathematically full-rank, just badly
-    conditioned). If your inputs can be exactly rank-deficient at q (e.g.
-    σ_q = 0 in fp64), use `_chol_mp_with_fallback` in `rsvd_eigh.py` or
-    `cholqr2` instead.
+  - Householder QR fallback handles the residual case where even fp64
+    Cholesky raises (truly rank-deficient input with σ_q = 0). Did not
+    fire on Qwen3.5-4B states across 14,042 MMLU prompts but is here for
+    correctness on synthetic / pathological inputs.
 
 Cost summary on Qwen3.5-4B recurrent states, [768, 128, 128] → rank 16:
-  - chol_mp single-pass (this file)        ~15 ms
-  - cholqr2 / house  (fallback path fires) ~110 ms
-  - chol_v6 + proactive jitter             ~10 ms (but +1.2pp recon bias)
-  - torch.svd_lowrank, GPU                 ~2150 ms
+  - this file (chol_mp + per-elem Householder)  ~15 ms (no failures);
+                                                ~5 ms extra per ~100 bad elements
+  - cholqr2 / house  (fallback path fires)      ~110 ms
+  - chol_v6 + proactive jitter                  ~10 ms (but +1.2pp recon bias)
+  - torch.svd_lowrank, GPU                      ~2150 ms
+
+When some batch elements are rank-deficient, the fallback uses
+`linalg.cholesky_ex` (returns per-element `info` rather than raising) and
+runs Householder QR only on the failing slice. At our standard [768, 128,
+24] sketch shape, this scales as roughly +0.04 ms per bad element on top
+of the fast path — vs +33 ms for the whole-batch fallback strategy.
 """
 
 from __future__ import annotations
@@ -55,29 +65,58 @@ from torch import Tensor
 
 
 def _chol_mp(Y: Tensor) -> Tensor:
-    """Single-pass Cholesky-QR in fp64.
+    """Single-pass Cholesky-QR in fp64 with per-element Householder fallback.
 
-    Computes the Gram, Cholesky factor, and triangular solve all in fp64,
-    then casts the result back to Y's original dtype. Buys ~8 extra
-    decimal digits over plain fp32 CholQR, which is enough to handle
+    Fast path: compute the Gram, Cholesky factor, and triangular solve all
+    in fp64, then cast the result back to Y's original dtype. Buys ~8
+    extra decimal digits over plain fp32 CholQR, which is enough to handle
     decaying-spectrum sketches where fp32 CholQR fails (κ² · ε ≈ 1)
     without introducing the systematic bias of jitter-based paths.
 
-    Cost: dominated by the fp64 Gram matmul `Yᵀ Y` on the tall-skinny
-    sketch. On GPU at the standard [B, 128, q] shape this is ~10–25 ms;
-    on CPU it's faster than Householder QR.
+    Fallback: `torch.linalg.cholesky_ex` returns per-element `info` codes
+    instead of raising. For elements where fp64 Cholesky succeeded
+    (`info == 0`), use the standard `solve_triangular` path. For elements
+    that failed (truly rank-deficient at q: σ_q = 0 in fp64), run
+    Householder QR via `torch.linalg.qr` on just that slice and scatter
+    the result back into the output tensor.
 
-    Raises `torch.linalg.LinAlgError` if the Cholesky fails — which only
-    happens when Y is exactly rank-deficient (σ_q = 0 to fp64 precision).
-    On natural data this effectively never occurs; if you need belt-and-
-    suspenders coverage for that case, wrap this in a try/except and fall
-    back to `torch.linalg.qr`.
+    Cost on a Qwen3.5-4B-shaped batch [B=768, m=128, q=24]:
+      - No failures:                 ~3 ms     (just cholesky_ex + trsm)
+      - 1 bad element out of 768:    ~5 ms     (vs ~36 ms for whole-batch
+                                                Householder fallback)
+      - 64 bad elements:             ~7 ms
+      - 256 bad elements:            ~13 ms
+      - All 768 elements bad:        ~28 ms
+
+    For workloads with extreme per-batch failure rates (>~30%), a CPU
+    Householder fallback on the bad slice is slightly faster than GPU
+    Householder (LAPACK beats cuSOLVER's batched-Householder dispatch on
+    tall-skinny [128, 24] panels). Not implemented here because the
+    common case is sparse failures where per-element GPU wins.
     """
     Y64 = Y.double()
     G = Y64.transpose(-2, -1) @ Y64
-    R = torch.linalg.cholesky(G, upper=True)
-    Q = torch.linalg.solve_triangular(R, Y64, upper=True, left=False)
-    return Q.to(Y.dtype)
+    R, info = torch.linalg.cholesky_ex(G, upper=True)
+    bad = info != 0
+
+    if not bad.any():
+        # Fast path: every batch element succeeded.
+        Q = torch.linalg.solve_triangular(R, Y64, upper=True, left=False)
+        return Q.to(Y.dtype)
+
+    # Mixed batch: scatter results from two paths.
+    ok = ~bad
+    Q_out = torch.empty_like(Y)
+    if ok.any():
+        Q_ok = torch.linalg.solve_triangular(
+            R[ok], Y64[ok], upper=True, left=False
+        )
+        Q_out[ok] = Q_ok.to(Y.dtype)
+    # Householder QR returns an orthonormal basis of range(Y[bad]) even
+    # when rank(Y[bad]) < q.
+    Q_bad = torch.linalg.qr(Y[bad], mode="reduced")[0]
+    Q_out[bad] = Q_bad
+    return Q_out
 
 
 @torch.no_grad()
