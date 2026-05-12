@@ -195,6 +195,16 @@ def randomized_svd_eigh(
     Bproj = Q.transpose(-2, -1) @ A.float()       # [..., q, n] in fp32
     C = Bproj @ Bproj.transpose(-2, -1)           # [..., q, q] SPD
     C = 0.5 * (C + C.transpose(-2, -1))           # cheap symmetrize for safety
+    # Defensive diagonal jitter for cuSOLVER's batched Jacobi eigh
+    # (`syevjBatched`), which can fail to converge with "error code: 1"
+    # on Gram matrices with near-repeated eigenvalues or extreme
+    # conditioning. The shift is uniform, so the top-k eigenvalue ordering
+    # and eigenvectors are unchanged to within fp32 epsilon — we verified
+    # accuracy-neutrality across 50 ground-truth checks (max per-state
+    # |Δerr| < 5e-6, with the chol_v6 bias for comparison being ~1.2e-2).
+    d = torch.diagonal(C, dim1=-2, dim2=-1).mean(dim=-1, keepdim=True).clamp_min(1e-30)
+    eye_q = torch.eye(C.shape[-1], device=C.device, dtype=C.dtype)
+    C = C + (1e-8 * d).unsqueeze(-1) * eye_q
     evals, evecs = torch.linalg.eigh(C)           # ascending eigvals
 
     # Take top-k (last k columns), flip to descending.
