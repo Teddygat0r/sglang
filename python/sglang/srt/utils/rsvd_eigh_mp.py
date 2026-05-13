@@ -205,7 +205,14 @@ def randomized_svd_eigh(
     d = torch.diagonal(C, dim1=-2, dim2=-1).mean(dim=-1, keepdim=True).clamp_min(1e-30)
     eye_q = torch.eye(C.shape[-1], device=C.device, dtype=C.dtype)
     C = C + (1e-8 * d).unsqueeze(-1) * eye_q
-    evals, evecs = torch.linalg.eigh(C)           # ascending eigvals
+    
+    #try fp32 first, on failure try fp64
+    try:
+        evals, evecs = torch.linalg.eigh(C)           # ascending eigvals
+    except torch.linalg.LinAlgError:
+        print("Exception occurred in torch.linalg.eigh, falling back to fp64")
+        evals, evecs = torch.linalg.eigh(C.double())           # ascending eigvals
+        evals, evecs = evals.float(), evecs.float()
 
     # Take top-k (last k columns), flip to descending.
     Sk = torch.sqrt(evals[..., -rank:].flip(-1).clamp_min(0))
@@ -219,7 +226,7 @@ def randomized_svd_eigh(
 def low_rank_svd(
     tensor: Tensor,
     n: int = 16,
-    oversample: int = 8,
+    oversample: int = 4,
     niter: int = 2,
 ) -> Tensor:
     """Rank-n reconstruction of `tensor` via `randomized_svd_eigh`.
@@ -231,9 +238,21 @@ def low_rank_svd(
         raise ValueError(f"SVD expects tensor rank >= 2, got shape {tuple(tensor.shape)}")
     orig_dtype = tensor.dtype
     rank = min(n, min(tensor.shape[-2:]))
-    u, s, vh = randomized_svd_eigh(
-        tensor.detach(), rank=rank, n_iter=niter, oversample=oversample
-    )
+    try:
+        u, s, vh = randomized_svd_eigh(
+            tensor.detach(), rank=rank, n_iter=niter, oversample=oversample
+        )
+    except torch.linalg.LinAlgError:
+        print("Exception occurred in randomized SVD, falling back to torch.svd_lowrank")
+        # perform low rank SVD on CPU
+        try:
+            tensor_cpu = tensor.cpu()
+            u, s, vh = torch.svd_lowrank(tensor_cpu, q=rank+oversample, oversample=oversample)
+            u, s, vh = u.to(tensor.device), s.to(tensor.device), vh.to(tensor.device)
+        except:
+            print("Exception occurred in torch.svd_lowrank, skipping SVD")
+            return tensor
+
     approx = (u * s.unsqueeze(-2)) @ vh
     return approx.to(orig_dtype)
 
