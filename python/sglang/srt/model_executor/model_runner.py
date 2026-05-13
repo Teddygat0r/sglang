@@ -2608,6 +2608,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         can_run_graph = (
             self.piecewise_cuda_graph_runner is not None
             and self.piecewise_cuda_graph_runner.can_run(forward_batch)
+            and not forward_batch.force_eager_step
         )
 
         if can_run_graph:
@@ -2736,6 +2737,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        # Let the model request an eager step (bypassing captured-graph dispatch)
+        # for data-dependent ops that can't replay from a static graph.
+        needs_eager = getattr(self.model, "needs_eager_forward", None)
+        if needs_eager is not None and needs_eager(forward_batch):
+            forward_batch.force_eager_step = True
+
         mode_check = (
             forward_batch.forward_mode.is_cpu_graph
             if self.device == "cpu"
@@ -2745,6 +2752,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             mode_check()
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
+            and not forward_batch.force_eager_step
         )
 
         if can_run_graph:

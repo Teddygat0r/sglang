@@ -94,6 +94,7 @@ from sglang.srt.utils import (
     set_weight_attrs,
 )
 from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
+from sglang.srt.utils.rsvd_eigh_mp import low_rank_svd
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
@@ -104,6 +105,10 @@ _is_amx_available = cpu_has_amx_support()
 
 
 cached_get_processor = lru_cache(get_processor)
+
+# Decode-side cadence for the GDN SSM-state SVD pass: run every N generated tokens
+# after the end-of-prefill fire.
+_GDN_SVD_DECODE_PERIOD = 1024
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
@@ -945,8 +950,122 @@ class Qwen3_5ForCausalLM(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
+        # Per-request baseline for the GDN SVD cadence: keys are req_pool_idx,
+        # values are the seq_len at which that request last had its SSM state
+        # SVD-approximated. Missing key means "fire at next decode step" (i.e.
+        # right after prefill). Entries are cleared whenever the req_pool_idx
+        # appears on an extend step, so the next decode fires once post-prefill.
+        self._gdn_svd_baseline: dict = {}
+
     def get_input_embeddings(self):
         return self.embed_tokens
+
+    def _compute_gdn_svd_trigger_mask(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[torch.Tensor]:
+        mode = forward_batch.forward_mode
+        req_pool_indices = forward_batch.req_pool_indices
+        if req_pool_indices is None:
+            return None
+        bs = forward_batch.batch_size
+        req_slots = req_pool_indices[:bs].tolist()
+
+        is_mixed = mode.is_mixed()
+        # Pure extend (EXTEND, DRAFT_EXTEND, TARGET_VERIFY, etc., but NOT MIXED):
+        # every request in the batch is extending, so clear their baselines and
+        # let the next decode step fire once post-prefill.
+        if mode.is_extend() and not is_mixed:
+            for req_slot in req_slots:
+                self._gdn_svd_baseline.pop(int(req_slot), None)
+            return None
+
+        if not (mode.is_decode() or is_mixed):
+            return None
+
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if seq_lens_cpu is None:
+            return None
+        seq_lens = seq_lens_cpu[:bs].tolist()
+
+        # In MIXED batches, extend_seq_lens_cpu[i] > 1 means request i is still
+        # processing a prefill chunk this step; == 1 means it's decoding one
+        # token like a normal decode request. Pure DECODE batches typically
+        # don't populate extend_seq_lens_cpu, so treat None as "all decoding".
+        ext_lens = forward_batch.extend_seq_lens_cpu if is_mixed else None
+
+        mask = torch.zeros(bs, dtype=torch.bool)
+        for i, req_slot in enumerate(req_slots):
+            req_slot = int(req_slot)
+            if ext_lens is not None and ext_lens[i] > 1:
+                # Still prefill-extending inside the mixed batch — clear baseline,
+                # don't fire. The first real decode step (next time this request
+                # shows up with ext_len == 1) will fire post-prefill SVD.
+                self._gdn_svd_baseline.pop(req_slot, None)
+                continue
+            seq_len = int(seq_lens[i])
+            baseline = self._gdn_svd_baseline.get(req_slot)
+            if baseline is None or seq_len - baseline >= _GDN_SVD_DECODE_PERIOD:
+                mask[i] = True
+                self._gdn_svd_baseline[req_slot] = seq_len
+        return mask
+
+    def needs_eager_forward(self, forward_batch: ForwardBatch) -> bool:
+        mask = self._compute_gdn_svd_trigger_mask(forward_batch)
+        if mask is None or not bool(mask.any().item()):
+            return False
+        forward_batch.gdn_svd_trigger_mask = mask
+        return True
+
+    def _apply_svd_to_ssm_state(self, forward_batch: ForwardBatch) -> None:
+        # Single batched compaction across all GDN layers on this PP rank: gather
+        # `temporal[selected]` from each layer, stack into one tensor, run a single
+        # `low_rank_svd`, and scatter back. This collapses N host syncs (one CPU
+        # round-trip per GDN layer) into 1 per fire.
+        if get_is_capture_mode():
+            return
+        mask = getattr(forward_batch, "gdn_svd_trigger_mask", None)
+        if mask is None:
+            return
+        attn_backend = getattr(forward_batch, "attn_backend", None)
+        linear_backend = getattr(attn_backend, "linear_attn_backend", None)
+        if linear_backend is None:
+            return
+        metadata = getattr(linear_backend, "forward_metadata", None)
+        pool = getattr(linear_backend, "req_to_token_pool", None)
+        if metadata is None or pool is None:
+            return
+        cache_indices = getattr(metadata, "mamba_cache_indices", None)
+        if cache_indices is None or cache_indices.numel() == 0:
+            return
+
+        bs = mask.shape[0]
+        cache_indices = cache_indices[:bs]
+        selected = cache_indices[mask.to(cache_indices.device)]
+        if selected.numel() == 0:
+            return
+
+        gdn_layer_caches = []
+        for layer_idx in range(self.start_layer, self.end_layer):
+            layer = self.layers[layer_idx]
+            if isinstance(layer, Qwen3_5LinearDecoderLayer):
+                gdn_layer_caches.append(
+                    pool.mamba2_layer_cache(layer.linear_attn.attn.layer_id)
+                )
+        if not gdn_layer_caches:
+            return
+
+        stacked = torch.stack(
+            [lc.temporal[selected] for lc in gdn_layer_caches], dim=0
+        )
+        logger.info(
+            "GDN SVD compaction firing: %d req(s), %d GDN layer(s), stacked shape %s",
+            int(selected.numel()),
+            len(gdn_layer_caches),
+            tuple(stacked.shape),
+        )
+        compressed = low_rank_svd(stacked, n=16)
+        for i, lc in enumerate(gdn_layer_caches):
+            lc.temporal[selected] = compressed[i]
 
     @property
     def start_layer(self) -> int:
@@ -1001,6 +1120,8 @@ class Qwen3_5ForCausalLM(nn.Module):
                 hidden_states.add_(
                     input_deepstack_embeds[:, sep : sep + self.hidden_size]
                 )
+
+        self._apply_svd_to_ssm_state(forward_batch)
 
         # Return intermediate tensors for pipeline parallelism
         if not self.pp_group.is_last_rank:
@@ -1330,6 +1451,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
 
+    def needs_eager_forward(self, forward_batch: ForwardBatch) -> bool:
+        inner = getattr(self, "model", None)
+        if inner is None or not hasattr(inner, "needs_eager_forward"):
+            return False
+        return inner.needs_eager_forward(forward_batch)
+
     @property
     def start_layer(self) -> int:
         return getattr(getattr(self, "model", None), "start_layer", 0)
@@ -1465,6 +1592,12 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.is_mrope_enabled = "mrope_section" in rope_config
 
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+
+    def needs_eager_forward(self, forward_batch: ForwardBatch) -> bool:
+        inner = getattr(self, "model", None)
+        if inner is None or not hasattr(inner, "needs_eager_forward"):
+            return False
+        return inner.needs_eager_forward(forward_batch)
 
     def get_embed_and_head(self):
         embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None

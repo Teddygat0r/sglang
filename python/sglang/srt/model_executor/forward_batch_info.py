@@ -311,6 +311,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
 
+    # If True, skip captured-CUDA-graph dispatch for this step and run the model
+    # eagerly. Models can request this via a `needs_eager_forward(forward_batch)`
+    # hook when they have a data-dependent op (e.g. the GDN SVD pass in qwen3_5)
+    # that can't be replayed from a captured graph.
+    force_eager_step: bool = False
+
     # For logprob
     return_logprob: bool = False
     top_logprobs_nums: Optional[List[int]] = None
