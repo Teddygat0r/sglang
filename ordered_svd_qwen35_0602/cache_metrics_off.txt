@@ -1,0 +1,3 @@
+# HELP sglang:cache_hit_rate The prefix cache hit rate.
+# TYPE sglang:cache_hit_rate gauge
+sglang:cache_hit_rate{engine_type="unified",model_name="Qwen/Qwen3.5-4B",moe_ep_rank="0",pp_rank="0",tp_rank="0"} 0.0

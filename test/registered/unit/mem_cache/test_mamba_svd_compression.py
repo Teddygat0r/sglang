@@ -171,6 +171,135 @@ class TestMambaSVDCompression(unittest.TestCase):
         self._tracked_reqs.append(req)
         return req
 
+    def _stop_compression_worker(self, tree):
+        tree._compression_stop_event.set()
+        tree._compression_thread.join(timeout=2.0)
+        self.assertFalse(tree._compression_thread.is_alive())
+
+    def test_compression_queue_retains_more_than_worker_batch(self):
+        tree = self._fresh_tree(svd_compression=True)
+        self._stop_compression_worker(tree)
+
+        for i in range(tree.svd_worker_batch + 1):
+            req = self._req()
+            tree.insert(
+                InsertParams(
+                    key=RadixKey([100 + i]),
+                    value=self.allocator.alloc(1),
+                    mamba_value=req.mamba_pool_idx.unsqueeze(0),
+                )
+            )
+
+        self.assertEqual(tree._compression_queue.qsize(), tree.svd_worker_batch + 1)
+        self.assertEqual(len(tree._pending_compression), tree.svd_worker_batch + 1)
+
+    def test_compression_worker_rejects_detached_node(self):
+        tree = self._fresh_tree(svd_compression=True)
+        self._stop_compression_worker(tree)
+
+        req = self._req()
+        tree.insert(
+            InsertParams(
+                key=RadixKey([200]),
+                value=self.allocator.alloc(1),
+                mamba_value=req.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+        item = tree._compression_queue.get_nowait()
+        node = tree.root_node.children.pop(200)
+
+        self.assertFalse(tree._is_live_compression_item(item))
+        self.assertNotIn(node.id, tree._pending_compression)
+
+    def test_late_compression_completion_after_reset_is_dropped(self):
+        tree = self._fresh_tree(svd_compression=True)
+        self._stop_compression_worker(tree)
+
+        req = self._req()
+        tree.insert(
+            InsertParams(
+                key=RadixKey([205]),
+                value=self.allocator.alloc(1),
+                mamba_value=req.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+        node = tree.root_node.children[205]
+        self.assertIn(node.id, tree._pending_compression)
+
+        packed = tree.compressed_temporal[0].clone()
+        tree.reset()
+
+        # Simulate an in-flight worker publishing a completion after flush/reset.
+        tree._compression_done_queue.put((node.id, packed))
+        tree.drain_compression_completions()
+
+        self.assertEqual(tree.mamba_evictable_size_, 0)
+        self.assertEqual(tree.mamba_protected_size_, 0)
+        self.assertFalse(node.mamba_compressed)
+        self.assertNotIn(node.id, tree._compressed_lru)
+        self.assertEqual(
+            len(tree._compressed_free_slots), tree.compressed_temporal.shape[0]
+        )
+
+    def test_compressed_parent_survives_tombstone_cleanup(self):
+        tree = self._fresh_tree(svd_compression=True)
+
+        parent_req = self._req()
+        tree.insert(
+            InsertParams(
+                key=RadixKey([210]),
+                value=self.allocator.alloc(1),
+                mamba_value=parent_req.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+        parent = tree.root_node.children[210]
+        self._drain_sync(tree)
+        self.assertTrue(parent.mamba_compressed)
+        self.assertIn(parent.id, tree._compressed_lru)
+
+        child_req = self._req()
+        tree.insert(
+            InsertParams(
+                key=RadixKey([210, 211]),
+                value=self.allocator.alloc(2),
+                mamba_value=child_req.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+        child = parent.children[211]
+
+        tree._evict_leaf_node(child, is_evict_mamba=False)
+
+        self.assertIs(tree.root_node.children[210], parent)
+        self.assertTrue(parent.mamba_compressed)
+        self.assertIn(parent.id, tree._compressed_lru)
+        self.assertTrue(tree.full_lru_list.in_list(parent))
+
+    def test_evict_compressed_lru_reclaims_detached_leaf(self):
+        tree = self._fresh_tree(svd_compression=True)
+
+        req = self._req()
+        tree.insert(
+            InsertParams(
+                key=RadixKey([220]),
+                value=self.allocator.alloc(1),
+                mamba_value=req.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+        node = tree.root_node.children[220]
+        self._drain_sync(tree)
+        self.assertTrue(node.mamba_compressed)
+
+        slot = node.compressed_slot
+        tree.root_node.children.pop(220)
+        tree.full_lru_list.remove_node(node)
+        tree.full_evictable_size_ -= len(node.key)
+
+        self.assertTrue(tree._evict_compressed_lru())
+        self.assertFalse(node.mamba_compressed)
+        self.assertIsNone(node.compressed_slot)
+        self.assertIn(slot, tree._compressed_free_slots)
+        self.assertNotIn(node.id, tree._compressed_lru)
+
     def test_compression_flag_set_after_drain(self):
         tree = self._fresh_tree(svd_compression=True)
         req = self._req()
