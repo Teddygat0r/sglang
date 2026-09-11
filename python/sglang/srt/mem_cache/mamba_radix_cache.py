@@ -20,9 +20,11 @@ The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
 """
 
 import heapq
-from collections import defaultdict
+import queue
+import threading
+from collections import OrderedDict, defaultdict
 from functools import lru_cache, partial
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 from numpy import float64
@@ -52,6 +54,7 @@ from sglang.srt.mem_cache.radix_cache import (
     _key_match_paged,
     get_child_key,
 )
+from sglang.srt.mem_cache.rsvd_eigh import randomized_svd_eigh
 from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
@@ -75,6 +78,8 @@ class TreeNode:
         self.value: Optional[torch.Tensor] = None
         self.mamba_value: Optional[torch.Tensor] = None
         self.mamba_host_value: Optional[torch.Tensor] = None
+        self.mamba_compressed: bool = False
+        self.compressed_slot: Optional[int] = None
         # invariant: for any node, if mamba_lock_ref is locked, full_lock_ref must be locked;
         # if full_lock_ref is locked, mamba_lock_ref doesn't need to be locked. So,
         # full_lock_ref is always >= mamba_lock_ref.
@@ -112,7 +117,11 @@ class TreeNode:
 
     @property
     def mamba_evicted(self):
-        return self.mamba_value is None
+        return self.mamba_value is None and not self.mamba_compressed
+
+    @property
+    def has_mamba_state(self) -> bool:
+        return self.mamba_value is not None or self.mamba_compressed
 
     @property
     def backuped(self):
@@ -442,6 +451,23 @@ class MambaRadixCache(BasePrefixCache):
         else:
             self.device = torch.device("cpu")
 
+        # SVD compression config
+        server_args = get_global_server_args()
+        self.enable_svd_compression = getattr(
+            server_args, "mamba_svd_compression", False
+        )
+        self.svd_rank = getattr(server_args, "mamba_svd_rank", 16)
+        self.svd_niter = getattr(server_args, "mamba_svd_niter", 1)
+        self.svd_oversample = getattr(server_args, "mamba_svd_oversample", 4)
+        # Greedy worker batch cap: how many pending snapshots to fold into one
+        # batched SVD call. Larger amortizes kernel launches; bounded so a burst
+        # of completions can't build an unboundedly large transient tensor.
+        self.svd_worker_batch = getattr(server_args, "mamba_svd_worker_batch", 8)
+        self._compression_thread: Optional[threading.Thread] = None
+        self._compression_stop_event: Optional[threading.Event] = None
+        if self.enable_svd_compression and self.req_to_token_pool.mamba_pool is not None:
+            self._init_compression_state()
+
         if params.enable_metrics:
             self.init_metrics_collector()
 
@@ -459,6 +485,8 @@ class MambaRadixCache(BasePrefixCache):
         return True
 
     def reset(self) -> None:
+        if self.enable_svd_compression and hasattr(self, "_pending_compression"):
+            self._reset_compression_state()
         self.root_node = TreeNode()
         self.root_node.key = RadixKey([], None)
         self.root_node.value = []
@@ -733,23 +761,32 @@ class MambaRadixCache(BasePrefixCache):
             x.full_lock_ref == 0 and x.mamba_lock_ref == 0
         ), f"evict leaf node invalid with {x.id=} {x.full_lock_ref=} {x.mamba_lock_ref=}"
 
-        assert x.mamba_value is not None, f"leaf node mamba value is not None, {x.id=}"
-        # 1. a leaf node, free full tokens and mamba
+        assert (
+            x.mamba_value is not None or x.mamba_compressed
+        ), f"leaf node mamba state missing, {x.id=}"
+        was_compressed = x.mamba_compressed
+        # 1. a leaf node, free full tokens
         self.token_to_kv_pool_allocator.free(x.value)
         full_num_evicted = len(x.value)
-        self.req_to_token_pool.mamba_pool.free(x.mamba_value)
-        mamba_num_evicted = len(x.mamba_value)
+        # Compressed leaves do not recover full-pool mamba slots (already freed
+        # at drain time), so they report 0 here.
+        mamba_num_evicted = 0 if was_compressed else len(x.mamba_value)
 
-        # 2. get the next node, update the lru lists
+        # 2. get the next node, update the lru lists BEFORE clearing mamba state
         if is_evict_mamba:
             x_next = self.mamba_lru_list.get_prev_no_lock(x)
         else:
             x_next = self.full_lru_list.get_prev_leaf_no_lock(x)
         self.full_lru_list.remove_node(x)
-        self.mamba_lru_list.remove_node(x)
+        # compressed nodes were removed from mamba_lru_list at compression commit
+        if not was_compressed:
+            self.mamba_lru_list.remove_node(x)
 
-        # 3. delete the leaf node
+        # 3. delete the leaf node (accounting uses mamba_value for non-compressed path)
         self._delete_leaf(x)
+
+        # 4. now release the actual underlying mamba state (full slot or compressed slot)
+        self._free_mamba_state(x)
 
         # 4. Iteratively delete tombstone leaves to maintain invariant that leaf nodes are not tombstone
         x, leaf_full_num_evicted = self._iteratively_delete_tombstone_leaf(x)
@@ -847,6 +884,12 @@ class MambaRadixCache(BasePrefixCache):
                 self.mamba_evictable_size_ -= len(node.mamba_value)
                 self.mamba_protected_size_ += len(node.mamba_value)
             node.mamba_lock_ref += 1
+        elif node.mamba_compressed:
+            # Compressed nodes don't contribute to mamba_evictable_size_ /
+            # mamba_protected_size_ (those count the full mamba pool only),
+            # but we still track mamba_lock_ref so _evict_compressed_lru skips
+            # in-use entries.
+            node.mamba_lock_ref += 1
 
         while node != self.root_node:
             # lock full from node to root
@@ -879,6 +922,14 @@ class MambaRadixCache(BasePrefixCache):
                 self.mamba_evictable_size_ += len(node.mamba_value)
                 self.mamba_protected_size_ -= len(node.mamba_value)
             node.mamba_lock_ref -= 1
+        elif node.mamba_compressed:
+            # Mirror of inc_lock_ref's compressed branch. Counter adjustments
+            # already happened at drain commit (mamba_protected_size_ -= 1 for
+            # locked-at-commit, mamba_evictable_size_ -= 1 for unlocked); here
+            # we just decrement the lock ref. Tolerate mamba_lock_ref == 0 to
+            # match the existing code style for skipped branches.
+            if node.mamba_lock_ref > 0:
+                node.mamba_lock_ref -= 1
 
         while node != self.root_node:
             assert (
@@ -953,6 +1004,417 @@ class MambaRadixCache(BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
+    def _init_compression_state(self) -> None:
+        """Allocate compressed pool + start background SVD worker."""
+        pool = self.req_to_token_pool.mamba_pool
+        temporal_shape = pool.mamba_cache.temporal.shape  # [L, N, H, D, S]
+        L, _, H, D, S = temporal_shape
+        temporal_dtype = pool.mamba_cache.temporal.dtype
+        r = self.svd_rank
+        packed_per_head = r * (D + 1 + S)
+        full_per_head = D * S
+        assert packed_per_head <= full_per_head, (
+            f"SVD rank {r} too large: packed U,S,V ({packed_per_head} elements) "
+            f"exceeds full-rank per-head size ({full_per_head}) for "
+            f"head_dim={D}, state_size={S}. Max rank: {full_per_head // (D + 1 + S)}"
+        )
+
+        num_compressed_slots = max(1, pool.size // 2)
+        self.compressed_temporal = torch.empty(
+            (num_compressed_slots, L, H, packed_per_head),
+            dtype=temporal_dtype,
+            device=self.device,
+        )
+        conv_tensors = pool.mamba_cache.conv
+        self.compressed_conv = [
+            torch.empty(
+                (num_compressed_slots, L, *c.shape[2:]),
+                dtype=c.dtype,
+                device=self.device,
+            )
+            for c in conv_tensors
+        ]
+        self._compressed_free_slots: List[int] = list(range(num_compressed_slots))
+        self._compressed_lru: "OrderedDict[int, TreeNode]" = OrderedDict()
+        self._pending_compression: Dict[int, TreeNode] = {}
+        self._compression_queue: queue.Queue = queue.Queue()
+        self._compression_done_queue: queue.Queue = queue.Queue()
+        self._compression_stop_event = threading.Event()
+        # Dedicated CUDA stream so SVD kernels overlap with inference instead
+        # of serializing on the default stream.
+        self._svd_device = pool.mamba_cache.temporal.device
+        if self._svd_device.type == "cuda":
+            self._svd_stream = torch.cuda.Stream(device=self._svd_device)
+        else:
+            self._svd_stream = None
+        # # Diagnostic counters — cheap, always on. Inspect via tree._compression_stats().
+        # self._svd_enqueued = 0
+        # self._svd_enqueue_skipped_inflight = 0
+        # self._svd_enqueue_skipped_no_slot = 0
+        # self._svd_worker_processed = 0
+        # self._svd_worker_failed = 0
+        # self._svd_committed = 0
+        # self._svd_dropped_evicted = 0
+        # self._svd_dropped_locked = 0
+        # self._svd_dropped_pool_full = 0
+        # self._svd_decompress_hits = 0
+
+        compressed_bytes = (
+            self.compressed_temporal.element_size() * self.compressed_temporal.numel()
+            + sum(c.element_size() * c.numel() for c in self.compressed_conv)
+        )
+        logger.info(
+            "Async SVD compression enabled: rank=%d, head_dim=%d, state_size=%d, "
+            "packed_per_head=%d, compressed_slots=%d, compressed_bytes=%.2fMB",
+            r,
+            D,
+            S,
+            packed_per_head,
+            num_compressed_slots,
+            compressed_bytes / (1024 * 1024),
+        )
+
+        self._compression_thread = threading.Thread(
+            target=self._compression_worker,
+            name="mamba-svd-worker",
+            daemon=True,
+        )
+        self._compression_thread.start()
+        logger.info(
+            "mamba-svd-worker thread started (alive=%s, daemon=%s)",
+            self._compression_thread.is_alive(),
+            self._compression_thread.daemon,
+        )
+
+    # def _compression_stats(self) -> dict:
+    #     """Diagnostic snapshot of compression pipeline state."""
+    #     if not self.enable_svd_compression:
+    #         return {"enable_svd_compression": False}
+    #     return {
+    #         "enable_svd_compression": True,
+    #         "worker_alive": bool(
+    #             self._compression_thread and self._compression_thread.is_alive()
+    #         ),
+    #         "work_queue_depth": self._compression_queue.qsize(),
+    #         "done_queue_depth": self._compression_done_queue.qsize(),
+    #         "pending": len(self._pending_compression),
+    #         "compressed_lru_size": len(self._compressed_lru),
+    #         "compressed_free_slots": len(self._compressed_free_slots),
+    #         "enqueued_total": self._svd_enqueued,
+    #         "enqueue_skipped_inflight": self._svd_enqueue_skipped_inflight,
+    #         "enqueue_skipped_no_slot": self._svd_enqueue_skipped_no_slot,
+    #         "worker_processed_total": self._svd_worker_processed,
+    #         "worker_failed_total": self._svd_worker_failed,
+    #         "committed_total": self._svd_committed,
+    #         "dropped_evicted": self._svd_dropped_evicted,
+    #         "dropped_locked": self._svd_dropped_locked,
+    #         "dropped_pool_full": self._svd_dropped_pool_full,
+    #         "decompress_hits": self._svd_decompress_hits,
+    #     }
+
+    def _reset_compression_state(self) -> None:
+        """Drop async SVD work and restore the compressed pool to an empty state."""
+        self._pending_compression.clear()
+        self._compressed_lru.clear()
+        self._compressed_free_slots = list(range(self.compressed_temporal.shape[0]))
+        self._drain_queue(self._compression_queue)
+        self._drain_queue(self._compression_done_queue)
+
+    @staticmethod
+    def _drain_queue(q: queue.Queue) -> None:
+        while True:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                return
+
+    def _is_live_compression_node(self, node: TreeNode) -> bool:
+        cur = node
+        while cur.parent is not None:
+            parent = cur.parent
+            if parent.children.get(self.get_child_key_fn(cur.key)) is not cur:
+                return False
+            cur = parent
+        return cur is self.root_node
+
+    def _enqueue_compression(self, node: TreeNode) -> None:
+        """Snapshot the node's full-rank state and post to the SVD worker.
+
+        The snapshot clone is issued on the *SVD stream*, not the default
+        (inference) stream, so the ~50-100MB copy does not contend with decode.
+        An event recorded on the current stream makes the SVD stream wait for
+        the prefill write that produced this slot before it reads. The host
+        cost of this method is just an event record plus a kernel launch on the
+        side stream, so the scheduler thread is not stalled by the copy."""
+        if not self.enable_svd_compression:
+            return
+        if node.mamba_value is None or node.mamba_compressed:
+            return
+        if not self._compressed_free_slots and not self._compressed_lru:
+            return
+        if node.id in self._pending_compression:
+            return
+
+        pool = self.req_to_token_pool.mamba_pool
+        # pool.mamba_cache.temporal shape is [L, N, H, D, S]; mamba_value is a [1] slot tensor
+        try:
+            src = pool.mamba_cache.temporal[:, node.mamba_value].squeeze(1).detach()
+            if self._svd_stream is not None:
+                event = torch.cuda.Event()
+                event.record()  # default stream: orders after the prefill write
+                with torch.cuda.stream(self._svd_stream):
+                    self._svd_stream.wait_event(event)
+                    gpu_snapshot = src.clone()  # clone runs on the SVD stream
+            else:
+                gpu_snapshot = src.clone()
+        except Exception as e:
+            logger.warning("Failed to snapshot mamba state for node %s: %s", node.id, e)
+            return
+
+        self._pending_compression[node.id] = node
+        self._compression_queue.put((node.id, gpu_snapshot))
+
+    def _compression_worker(self) -> None:
+        """Background daemon thread: pops GPU snapshots, runs a single *batched*
+        randomized SVD on a side CUDA stream over all snapshots immediately
+        available (up to svd_worker_batch), blocks the worker (not the
+        scheduler) until the GPU work completes, then publishes packed tensors.
+
+        Batching matters: every snapshot is the same shape [L, H, D, S], so
+        stacking K of them into [K, L, H, D, S] lets one rsvd_eigh call cover
+        the whole group. That amortizes kernel-launch overhead and keeps the
+        SVD kernels large enough to run efficiently, which shortens the total
+        time the side stream competes with inference for SMs."""
+        stop_event = self._compression_stop_event
+        if self._svd_device.type == "cuda":
+            torch.cuda.set_device(self._svd_device)
+        while not stop_event.is_set():
+            try:
+                first = self._compression_queue.get(block=True, timeout=1.0)
+            except queue.Empty:
+                continue
+            if first is None:
+                continue
+            # Greedily gather any other snapshots already waiting, so a backlog
+            # collapses into one batched SVD instead of N serial ones.
+            batch = [first]
+            while len(batch) < self.svd_worker_batch:
+                try:
+                    nxt = self._compression_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if nxt is not None:
+                    batch.append(nxt)
+            # A queued snapshot can outlive its radix node. Filter stale work
+            # before launching SVD so evicted nodes do not consume GPU time.
+            batch = [item for item in batch if self._is_live_compression_item(item)]
+            if not batch:
+                continue
+            try:
+                self._process_compression_batch(batch)
+            except Exception as e:
+                node_ids = [b[0] for b in batch]
+                logger.warning("Async SVD batch failed for nodes %s: %s", node_ids, e)
+
+    def _is_live_compression_item(self, item: Tuple[int, torch.Tensor]) -> bool:
+        """Return whether a queued snapshot still belongs to a live radix node."""
+        node_id, _ = item
+        node = self._pending_compression.get(node_id)
+        if node is None:
+            return False
+        if node.mamba_value is None or node.mamba_compressed:
+            self._pending_compression.pop(node_id, None)
+            return False
+        if not self._is_live_compression_node(node):
+            self._pending_compression.pop(node_id, None)
+            return False
+        return True
+
+    def _process_compression_batch(self, batch: List[Tuple[int, torch.Tensor]]) -> None:
+        """Run one batched SVD over `batch` snapshots and post packed results."""
+        rank = self.svd_rank
+        node_ids = [b[0] for b in batch]
+        snapshots = [b[1] for b in batch]
+        K = len(snapshots)
+        L, H, D, S = snapshots[0].shape
+        effective_rank = min(rank, D, S)
+
+        def _run():
+            stacked = torch.stack(snapshots, dim=0)  # [K, L, H, D, S]
+            u, s, vh = randomized_svd_eigh(
+                stacked,
+                rank=effective_rank,
+                n_iter=self.svd_niter,
+                oversample=self.svd_oversample,
+            )
+            u_flat = u.reshape(K, L, H, D * effective_rank)
+            v_flat = vh.transpose(-2, -1).reshape(K, L, H, S * effective_rank)
+            packed = torch.cat([u_flat, s, v_flat], dim=-1)  # [K, L, H, (D+1+S)*r]
+            return packed
+
+        if self._svd_stream is not None:
+            with torch.cuda.stream(self._svd_stream):
+                packed = _run()
+            self._svd_stream.synchronize()
+        else:
+            packed = _run()
+
+        for i, node_id in enumerate(node_ids):
+            self._compression_done_queue.put((node_id, packed[i]))
+
+    def drain_compression_completions(self, max_per_call: int = 8) -> None:
+        """Main-thread drain: commit completed SVD packs into the compressed pool.
+
+        Capped low (8) so a burst of completions does not fire many GPU->GPU
+        commit copies on the inference (default) stream in a single scheduler
+        step, which would spike decode latency. Remaining completions are
+        committed on subsequent steps."""
+        if not self.enable_svd_compression:
+            return
+        pool = self.req_to_token_pool.mamba_pool
+        rank = self.svd_rank
+        for _ in range(max_per_call):
+            try:
+                node_id, packed = self._compression_done_queue.get_nowait()
+            except queue.Empty:
+                return
+            node = self._pending_compression.pop(node_id, None)
+            if node is None:
+                continue
+            if (
+                node.mamba_value is None
+                or node.mamba_compressed
+                or not self._is_live_compression_node(node)
+            ):
+                continue  # evicted or already committed — discard
+            # NOTE: committing while locked (mamba_lock_ref > 0) is safe. The
+            # tree's node.mamba_value is a fork separate from req.mamba_pool_idx,
+            # so freeing it does not disturb the running request's working slot.
+            # The scheduler is single-threaded, so no concurrent read race.
+            if not self._compressed_free_slots:
+                if not self._evict_compressed_lru():
+                    continue  # every compressed entry is locked — drop
+            c_slot = self._compressed_free_slots.pop()
+            full_slot = node.mamba_value
+            # 1. Write compressed temporal + conv to the new compressed slot.
+            # `packed` already lives on the same CUDA device as compressed_temporal
+            # (produced by the GPU SVD worker); .to() is a dtype cast only.
+            self.compressed_temporal[c_slot].copy_(
+                packed.to(dtype=self.compressed_temporal.dtype)
+            )
+            for i, conv_t in enumerate(pool.mamba_cache.conv):
+                self.compressed_conv[i][c_slot].copy_(
+                    conv_t[:, full_slot].squeeze(1)
+                )
+            # 2. Option A: remove from mamba_lru_list BEFORE clearing mamba_value
+            # (the list's assertions require mamba_value to still be non-None).
+            if self.mamba_lru_list.in_list(node):
+                self.mamba_lru_list.remove_node(node)
+            # 3. Hand off the node's contribution from the full-pool counters.
+            # A locked full-rank node lives in mamba_protected_size_; an
+            # unlocked one in mamba_evictable_size_. Dispatch based on the
+            # current lock state. After commit, neither counter tracks this
+            # node (compressed pool has its own bookkeeping).
+            if node.mamba_lock_ref > 0:
+                self.mamba_protected_size_ -= len(full_slot)
+            else:
+                self.mamba_evictable_size_ -= len(full_slot)
+            # 4. Free the full-rank slot.
+            pool.free(full_slot)
+            # 5. Atomic state swap — single-writer (scheduler) thread, no lock.
+            node.mamba_value = None
+            node.compressed_slot = c_slot
+            node.mamba_compressed = True
+            # 6. Insert into compressed LRU. Locked compressed nodes stay in
+            # the list; _evict_compressed_lru skips them.
+            self._compressed_lru[node.id] = node
+
+    def _evict_compressed_lru(self) -> bool:
+        """Reclaim one compressed slot. Internal victims become mamba tombstones;
+        leaf victims are fully evicted (attention KV + radix leaf). Returns True on success."""
+        if not self._compressed_lru:
+            return False
+        scanned: set = set()
+        while self._compressed_lru:
+            node_id, victim = next(iter(self._compressed_lru.items()))
+            if node_id in scanned:
+                return False  # every entry is locked — give up
+            # Internal victims only need mamba_lock_ref==0; leaf victims also need
+            # full_lock_ref==0 because we'll free their attention KV.
+            is_leaf = len(victim.children) == 0
+            if victim.mamba_lock_ref > 0 or (is_leaf and victim.full_lock_ref > 0):
+                scanned.add(node_id)
+                self._compressed_lru.move_to_end(node_id)
+                continue
+
+            parent = victim.parent
+            live_child = (
+                parent is not None
+                and parent.children.get(self.get_child_key_fn(victim.key)) is victim
+            )
+            if not live_child:
+                # The compressed worker can race with radix deletion: a node may
+                # stay in _compressed_lru after it was unlinked elsewhere. Reclaim
+                # only its compressed slot; full KV/tree accounting has already
+                # been handled by the unlinking path.
+                self._free_mamba_state(victim)
+                return True
+
+            if is_leaf:
+                if not self.full_lru_list.in_list(victim):
+                    scanned.add(node_id)
+                    self._compressed_lru.move_to_end(node_id)
+                    continue
+                self._evict_leaf_node(victim, is_evict_mamba=False)
+            else:
+                self._free_mamba_state(victim)
+            # For internal victims, the node becomes a mamba tombstone but keeps its
+            # attention KV — matches the existing evict_mamba tombstone semantics.
+            return True
+        return False
+
+    def _free_mamba_state(self, node: TreeNode) -> None:
+        """Dispatcher: release a node's mamba state (compressed or full-rank)."""
+        if node.mamba_compressed:
+            if node.compressed_slot is not None:
+                self._compressed_free_slots.append(node.compressed_slot)
+                node.compressed_slot = None
+            self._compressed_lru.pop(node.id, None)
+            node.mamba_compressed = False
+        elif node.mamba_value is not None:
+            self.req_to_token_pool.mamba_pool.free(node.mamba_value)
+            node.mamba_value = None
+
+    def _decompress_from_pool(
+        self, src_node: TreeNode, dst_index: torch.Tensor
+    ) -> None:
+        """Reconstruct full mamba state at dst_index from either compressed or full-rank source."""
+        pool = self.req_to_token_pool.mamba_pool
+        if not src_node.mamba_compressed:
+            logger.info(f"Full-rank mamba state from {src_node.id} to {dst_index}")
+            pool.copy_from(src_node.mamba_value, dst_index)
+            return
+
+        logger.info(f"Decompressing compressed mamba state from {src_node.id} to {dst_index}")
+        rank = self.svd_rank
+        c_slot = src_node.compressed_slot
+        packed = self.compressed_temporal[c_slot]  # [L, H, (D+1+S)*r]
+        L, H, _ = packed.shape
+        D = pool.mamba_cache.temporal.shape[-2]
+        S = pool.mamba_cache.temporal.shape[-1]
+        r = rank
+        u = packed[:, :, : D * r].reshape(L, H, D, r)
+        s = packed[:, :, D * r : D * r + r]
+        v = packed[:, :, D * r + r : D * r + r + S * r].reshape(L, H, S, r)
+        full_state = (u * s.unsqueeze(-2)) @ v.transpose(-2, -1)
+        pool.mamba_cache.temporal[:, dst_index] = full_state.unsqueeze(1).to(
+            dtype=pool.mamba_cache.temporal.dtype
+        )
+        for i, conv_t in enumerate(pool.mamba_cache.conv):
+            conv_t[:, dst_index] = self.compressed_conv[i][c_slot].unsqueeze(1).to(
+                dtype=conv_t.dtype
+            )
+
     def _match_prefix_helper(
         self, key: RadixKey
     ) -> Tuple[List[torch.Tensor], TreeNode, int]:
@@ -971,7 +1433,7 @@ class MambaRadixCache(BasePrefixCache):
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             # update best_value_len and best_last_node if needed
-            if node.mamba_value is not None:
+            if node.has_mamba_state:
                 best_value_len = len(value)
                 best_last_node = node
 
@@ -989,7 +1451,7 @@ class MambaRadixCache(BasePrefixCache):
                 if len(key):
                     child_key = self.get_child_key_fn(key)
         # handle best_value_len and best_last_node, for the case that last node is fully matched
-        if node.mamba_value is not None:
+        if node.has_mamba_state:
             best_value_len = len(value)
             best_last_node = node
 
@@ -1020,6 +1482,14 @@ class MambaRadixCache(BasePrefixCache):
         node_update = last_node
         self.full_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
         self.mamba_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
+        # Bump compressed ancestors in the compressed LRU (they're excluded from
+        # mamba_lru_list under Option A, so we walk separately).
+        if self.enable_svd_compression and self._compressed_lru:
+            ancestor = node_update
+            while ancestor is not None and ancestor != self.root_node:
+                if ancestor.mamba_compressed and ancestor.id in self._compressed_lru:
+                    self._compressed_lru.move_to_end(ancestor.id)
+                ancestor = ancestor.parent
 
         # This last_access_time is for sanity check, can be deleted after validation in production
         cur_time = get_last_access_time()
@@ -1046,7 +1516,7 @@ class MambaRadixCache(BasePrefixCache):
             mamba_branching_seqlen = None
 
         # Copy mamba state to req local space if cow is true
-        if cow_mamba and last_node.mamba_value is not None:
+        if cow_mamba and last_node.has_mamba_state:
             # for reqs without mamba cache
             if req.mamba_pool_idx is None:
                 dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
@@ -1057,13 +1527,11 @@ class MambaRadixCache(BasePrefixCache):
                     dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
                     self.dec_lock_ref(last_node)
                     assert dst_index is not None, "Can not alloc mamba cache"
-                src_index = last_node.mamba_value
-                self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
+                self._decompress_from_pool(last_node, dst_index)
                 req.mamba_pool_idx = dst_index[0]
             else:
-                src_index = last_node.mamba_value
                 dst_index = req.mamba_pool_idx.unsqueeze(0)
-                self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
+                self._decompress_from_pool(last_node, dst_index)
 
         value = value[:best_value_len]
         if value:
@@ -1108,6 +1576,14 @@ class MambaRadixCache(BasePrefixCache):
             self.mamba_lru_list.insert_mru(child)
         return new_node
 
+    def _bump_mamba_mru(self, node: TreeNode) -> None:
+        """Dispatch MRU bump for a node that has any form of mamba state."""
+        if node.mamba_compressed:
+            if node.id in self._compressed_lru:
+                self._compressed_lru.move_to_end(node.id)
+        elif node.mamba_value is not None:
+            self.mamba_lru_list.reset_node_mru(node)
+
     def _insert_helper(
         self,
         node: TreeNode,
@@ -1123,8 +1599,7 @@ class MambaRadixCache(BasePrefixCache):
         node.last_access_time = get_last_access_time()
         if node != self.root_node:
             self.full_lru_list.reset_node_mru(node)
-            if node.mamba_value is not None:
-                self.mamba_lru_list.reset_node_mru(node)
+            self._bump_mamba_mru(node)
         if len(key) == 0:
             return 0, True
 
@@ -1135,8 +1610,7 @@ class MambaRadixCache(BasePrefixCache):
             node = node.children[child_key]
             node.last_access_time = get_last_access_time()
             self.full_lru_list.reset_node_mru(node)
-            if node.mamba_value is not None:
-                self.mamba_lru_list.reset_node_mru(node)
+            self._bump_mamba_mru(node)
             prefix_len = self.key_match_fn(node.key, key)
 
             if prev_prefix_len < total_prefix_length + prefix_len:
@@ -1166,16 +1640,18 @@ class MambaRadixCache(BasePrefixCache):
             node.children[child_key] = new_node
             self.full_evictable_size_ += len(value)
             self.mamba_evictable_size_ += len(mamba_value)
-        elif node.mamba_value is None:  # add for mamba tombstone
+            self._enqueue_compression(new_node)
+        elif node.mamba_value is None and not node.mamba_compressed:  # tombstone upgrade
             node.mamba_value = mamba_value
             self.full_lru_list.reset_node_mru(node)
             self.mamba_lru_list.insert_mru(node)
             self.mamba_evictable_size_ += len(mamba_value)
             node.last_access_time = get_last_access_time()
-        else:  # mamba value already exists
+            self._enqueue_compression(node)
+        else:  # mamba state already exists (full slot or compressed)
             mamba_value_exist = True
             self.full_lru_list.reset_node_mru(node)
-            self.mamba_lru_list.reset_node_mru(node)
+            self._bump_mamba_mru(node)
             node.last_access_time = get_last_access_time()
 
         return total_prefix_length, mamba_value_exist
@@ -1184,7 +1660,7 @@ class MambaRadixCache(BasePrefixCache):
         self, node: TreeNode
     ) -> Tuple[TreeNode, int]:
         full_num_evicted = 0
-        while node.parent.mamba_value is None and len(node.parent.children) == 0:
+        while not node.parent.has_mamba_state and len(node.parent.children) == 0:
             # root node is not evictable
             if node.parent == self.root_node:
                 break
@@ -1205,7 +1681,7 @@ class MambaRadixCache(BasePrefixCache):
 
     def _delete_leaf(self, node: TreeNode) -> None:
         assert (
-            node.mamba_value is not None
+            node.mamba_value is not None or node.mamba_compressed
         ), f"Invariant violated: leaf node is a tombstone, {node.id=}"
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
         key = self.get_child_key_fn(node.key)
@@ -1213,12 +1689,17 @@ class MambaRadixCache(BasePrefixCache):
         assert v == node, f"parent does not have child key, {key}"
 
         self.full_evictable_size_ -= len(node.key)
-        self.mamba_evictable_size_ -= len(node.mamba_value)
+        # Compressed leaves no longer contribute to mamba_evictable_size_ (that
+        # counter was decremented at drain time), so only decrement for the
+        # full-pool case.
+        if not node.mamba_compressed:
+            self.mamba_evictable_size_ -= len(node.mamba_value)
 
     def _tombstone_internal_node(self, node: TreeNode) -> None:
         assert len(node.children) != 0, f"Cannot tombstone a leaf node, {node.id=}"
         self.mamba_evictable_size_ -= len(node.mamba_value)
         node.mamba_value = None
+        node.mamba_compressed = False
 
     def _delete_tombstone_leaf(self, node: TreeNode) -> None:
         assert (
@@ -1237,6 +1718,8 @@ class MambaRadixCache(BasePrefixCache):
 
         while stack:
             cur_node = stack.pop()
+            # Only nodes carrying full-rank mamba state belong in mamba_lru_list;
+            # compressed nodes live in _compressed_lru exclusively (Option A).
             if cur_node.mamba_value is not None:
                 ret_list.append(cur_node)
             stack.extend(cur_node.children.values())

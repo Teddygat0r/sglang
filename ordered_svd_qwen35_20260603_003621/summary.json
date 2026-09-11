@@ -1,0 +1,106 @@
+{
+  "benchmark_args": {
+    "model": "Qwen/Qwen3.5-4B",
+    "backend": "sglang",
+    "dataset_name": "generated-shared-prefix",
+    "gsp_num_groups": 50,
+    "gsp_prompts_per_group": 10,
+    "gsp_system_prompt_len": 10240,
+    "gsp_question_len": 256,
+    "gsp_output_len": 128,
+    "gsp_ordered": true,
+    "max_concurrency": 5,
+    "seed": 20260603,
+    "flush_cache": true
+  },
+  "server_common_args": {
+    "mem_fraction_static": 0.85,
+    "max_running_requests": 32,
+    "disable_cuda_graph": true,
+    "disable_piecewise_cuda_graph": true,
+    "disable_overlap_schedule": true,
+    "enable_metrics": true,
+    "random_seed": 1234
+  },
+  "runs": [
+    {
+      "label": "svd_off",
+      "file": "bench_off.jsonl",
+      "duration": 892.42597114807,
+      "completed": 500,
+      "request_throughput": 0.5602705615534365,
+      "input_throughput": 6027.014199374506,
+      "output_throughput": 71.71463187883987,
+      "total_throughput": 6098.728831253345,
+      "mean_e2e_latency_ms": 8922.67477199994,
+      "median_e2e_latency_ms": 8955.418192315847,
+      "p90_e2e_latency_ms": 9860.201713535935,
+      "p99_e2e_latency_ms": 9905.592293194495,
+      "mean_ttft_ms": 2597.7972609698772,
+      "median_ttft_ms": 2684.381734346971,
+      "p99_ttft_ms": 3989.5239907875653,
+      "mean_tpot_ms": 49.80218512622096,
+      "median_tpot_ms": 47.13002931121297,
+      "p99_tpot_ms": 59.93698290325555,
+      "mean_itl_ms": 49.81469522567536,
+      "median_itl_ms": 46.436120523139834,
+      "p95_itl_ms": 48.50606434047222,
+      "p99_itl_ms": 49.87216260749847,
+      "total_input_tokens": 5378664,
+      "total_output_tokens": 64000,
+      "max_output_tokens_per_s": 110.0,
+      "max_concurrent_requests": 10,
+      "concurrency": 4.9991120050670865
+    },
+    {
+      "label": "svd_on_rank16",
+      "file": "bench_on_retry.jsonl",
+      "duration": 896.7033194028772,
+      "completed": 500,
+      "request_throughput": 0.5575980251003805,
+      "input_throughput": 5998.264848157025,
+      "output_throughput": 71.3725472128487,
+      "total_throughput": 6069.637395369874,
+      "mean_e2e_latency_ms": 8965.432070351206,
+      "median_e2e_latency_ms": 9384.928948478773,
+      "p90_e2e_latency_ms": 9892.450843984261,
+      "p99_e2e_latency_ms": 10345.9515781654,
+      "mean_ttft_ms": 2636.921948102303,
+      "median_ttft_ms": 2884.3259701970965,
+      "p99_ttft_ms": 4212.020027521066,
+      "mean_tpot_ms": 49.83078836416459,
+      "median_tpot_ms": 47.266702290521714,
+      "p99_tpot_ms": 60.401242321364464,
+      "mean_itl_ms": 49.844097910013225,
+      "median_itl_ms": 46.24735517427325,
+      "p95_itl_ms": 48.734316881746054,
+      "p99_itl_ms": 56.94449410773814,
+      "total_input_tokens": 5378664,
+      "total_output_tokens": 64000,
+      "max_output_tokens_per_s": 110.0,
+      "max_concurrent_requests": 10,
+      "concurrency": 4.999107216599447
+    }
+  ],
+  "cache_stats": [
+    {
+      "log": "server_off.log",
+      "batches": 281,
+      "prefill_sequences": 631,
+      "new_tokens_logged": 1543620,
+      "cached_tokens_logged": 3835044,
+      "cache_hit_rate": 0.713010517109825
+    },
+    {
+      "log": "server_on_retry2.log",
+      "batches": 281,
+      "prefill_sequences": 631,
+      "new_tokens_logged": 1543620,
+      "cached_tokens_logged": 3835044,
+      "cache_hit_rate": 0.713010517109825
+    }
+  ],
+  "notes": [
+    "SVD-on server required TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas on GB10/sm_121a."
+  ]
+}

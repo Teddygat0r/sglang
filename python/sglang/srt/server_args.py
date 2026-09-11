@@ -545,6 +545,11 @@ class ServerArgs:
 
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
+    mamba_svd_compression: bool = False
+    mamba_svd_rank: int = 16
+    mamba_svd_niter: int = 1
+    mamba_svd_oversample: int = 4
+    mamba_svd_worker_batch: int = 8
     mamba_ssm_dtype: Optional[str] = None
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
@@ -5036,6 +5041,39 @@ class ServerArgs:
         )
 
         # Mamba Cache
+        parser.add_argument(
+            "--mamba-svd-compression",
+            action="store_true",
+            default=ServerArgs.mamba_svd_compression,
+            help="Compress mamba temporal states via low-rank SVD in the prefix cache.",
+        )
+        parser.add_argument(
+            "--mamba-svd-rank",
+            type=int,
+            default=ServerArgs.mamba_svd_rank,
+            help="Target rank for SVD compression of mamba temporal states.",
+        )
+        parser.add_argument(
+            "--mamba-svd-niter",
+            type=int,
+            default=ServerArgs.mamba_svd_niter,
+            help="Power iterations for randomized SVD of mamba states. Lower is "
+            "faster (less side-stream compute); higher is more accurate.",
+        )
+        parser.add_argument(
+            "--mamba-svd-oversample",
+            type=int,
+            default=ServerArgs.mamba_svd_oversample,
+            help="Oversampling columns beyond the target rank for randomized SVD "
+            "of mamba states. Lower is faster; higher tightens the approximation.",
+        )
+        parser.add_argument(
+            "--mamba-svd-worker-batch",
+            type=int,
+            default=ServerArgs.mamba_svd_worker_batch,
+            help="Max pending mamba-state snapshots folded into one batched SVD "
+            "call by the async worker. Larger amortizes kernel-launch overhead.",
+        )
         parser.add_argument(
             "--max-mamba-cache-size",
             type=int,
