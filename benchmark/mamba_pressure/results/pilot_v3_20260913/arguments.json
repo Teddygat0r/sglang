@@ -1,0 +1,15 @@
+{
+  "results": "benchmark/mamba_pressure/results/pilot_v3_20260913",
+  "budgets": [
+    24,
+    48
+  ],
+  "repetitions": 1,
+  "groups": 64,
+  "rounds": 2,
+  "prefix": 2048,
+  "output": 8,
+  "kv_tokens": 262144,
+  "seed": 20260913,
+  "port": 31035
+}

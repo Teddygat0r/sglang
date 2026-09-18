@@ -1,0 +1,25 @@
+{
+  "git_commit": "b2982df42f5be1a21500b55545670d37ee10118a",
+  "git_status": "?? benchmark/mamba_cache_pressure_notes.md\n?? benchmark/mamba_pressure/",
+  "gpu": "Mon Sep 14 04:18:54 2026       \n+-----------------------------------------------------------------------------------------+\n| NVIDIA-SMI 580.95.05              Driver Version: 580.95.05      CUDA Version: 13.0     |\n+-----------------------------------------+------------------------+----------------------+\n| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |\n| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |\n|                                         |                        |               MIG M. |\n|=========================================+========================+======================|\n|   0  NVIDIA GB10                    On  |   0000000F:01:00.0 Off |                  N/A |\n| N/A   65C    P0             13W /  N/A  | Not Supported          |      0%      Default |\n|                                         |                        |                  N/A |\n+-----------------------------------------+------------------------+----------------------+\n\n+-----------------------------------------------------------------------------------------+\n| Processes:                                                                              |\n|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |\n|        ID   ID                                                               Usage      |\n|=========================================================================================|\n|    0   N/A  N/A            2944      G   /usr/lib/xorg/Xorg                       66MiB |\n|    0   N/A  N/A            3178      G   /usr/bin/gnome-shell                     37MiB |\n|    0   N/A  N/A         3969768      C   ...e/sbzhang/ra/.venv/bin/python        274MiB |\n+-----------------------------------------------------------------------------------------+",
+  "python": "3.12.12 (main, Oct 31 2025, 23:00:46) [Clang 21.1.4 ]",
+  "script_sha256": {
+    "instrumentation.py": "1249507c83259b6786f34c15813bb642f45aff1d20d7b883fca9e40256f36dee",
+    "revised.py": "91a4ff0dca993900dc04d442a91d6f6f0616494886ea39e31a443d3d4356ee6a",
+    "report.py": "07f9f1b39765932db38060716f4197a8ea624ec35fb8c488d0daf0d27efccdd6",
+    "search.py": "d16a85ef226f690cca08fc083f3e42447bb1d949af3c5caa3d73ba98144f5ff0",
+    "audit.py": "c27a21581d65653ed44dd24540b0752f93e500fdc10a867d8ae268767f0ce8d6",
+    "run.py": "3b3709c1f67d5db182beec5a6909be3cd2f396401faf2f2973c56a88ea151ff3",
+    "server.py": "26973bf35fa4993a2bf54b63cbf7f7e1f945223067295213d85f377b06391198",
+    "test_analysis.py": "4b5449b2d0292fe521e72da14b4a1fc048fe28f89952f75d3e62dec18f768870",
+    "test_telemetry.py": "1afba35a47c633e6f5d2ec0f7d0d7007503ef25b83a9d7cc94c30a5c94be9afc"
+  },
+  "trace_sha256": {
+    "trace_3.json": "7b6de22b5ab9dd4c87965d73fc5deb94917f65a49b749cfb20d36d6826b979f0",
+    "trace_2.json": "a5155e955b049df3c0123726af55a65a57dd70c57b815eb0de4c764ee0c9a71f",
+    "trace_1.json": "86ad01e165e1db6e3bc236f3e1ceaa09c47322bf4bd699aa6e2a0b3724265234",
+    "trace_0.json": "c0a13f2c59ce0443c6b94cb5876680a6b959704cca7a79c376e1e3a1f56a8980",
+    "trace_5.json": "f39aa0667dfaa04379c585384e514492f8925dea6a450cfbf348b4b32029e75e",
+    "trace_4.json": "15eb3fa3a274e073424681c5b2c3ec8c1bad9f2e6e4b6c070b28abc7e87586f0"
+  }
+}

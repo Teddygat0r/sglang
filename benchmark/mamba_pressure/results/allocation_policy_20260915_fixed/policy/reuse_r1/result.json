@@ -1,0 +1,47 @@
+{
+  "config": {
+    "baseline_slots": 24,
+    "compression": true,
+    "full_slots": 8,
+    "compressed_slots": 29,
+    "policy": "reuse",
+    "kv_tokens": 262144,
+    "budget_bytes": 9877749760,
+    "staging_reserve_bytes": 412090368
+  },
+  "repetition": 1,
+  "metrics": {
+    "requests": 192,
+    "duration_s": 150.12960504367948,
+    "token_cache_hit_rate": 0.020671834625323,
+    "evicted_entries": 542,
+    "evicted_compressed_entries": 542,
+    "evicted_kv_tokens": 362586,
+    "recomputed_prefix_tokens": 253952,
+    "request_throughput_rps": 1.2788949917249068,
+    "output_throughput_tps": 10.231159933799255,
+    "mean_ttft_ms": 423.0525345095278,
+    "p50_ttft_ms": 430.2300876006484,
+    "p95_ttft_ms": 436.8489921092987,
+    "p99_ttft_ms": 450.2267269231379,
+    "mean_tpot_ms": 51.23716517534506,
+    "persistent_cache_mib": 9016.140625,
+    "peak_cache_state_mib": 9124.1875,
+    "peak_staging_mib": 108.046875,
+    "peak_process_cuda_mib": 18964.62109375,
+    "compression_pending_peak": 2,
+    "compression_enqueued": 572,
+    "compression_completed": 571,
+    "compression_completion_fraction": 0.9982517482517482,
+    "compression_completion_per_s": 3.803380418098551,
+    "compression_committed": 571,
+    "compression_failed": 0,
+    "decompression_hits": 4
+  },
+  "validation": {
+    "all_requests_completed": true,
+    "within_cache_budget": true,
+    "baseline_evicted": null,
+    "no_compression_failures": true
+  }
+}

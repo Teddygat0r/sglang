@@ -1,0 +1,43 @@
+{
+  "arguments": {
+    "groups": 64,
+    "rounds": 3,
+    "prefix": 2048,
+    "output": 8,
+    "seed": 20261101,
+    "port": 31036
+  },
+  "configs": {
+    "lru": {
+      "baseline_slots": 24,
+      "compression": true,
+      "full_slots": 8,
+      "compressed_slots": 29,
+      "policy": "lru",
+      "kv_tokens": 262144,
+      "budget_bytes": 9877749760,
+      "staging_reserve_bytes": 412090368
+    },
+    "retain_full": {
+      "baseline_slots": 24,
+      "compression": true,
+      "full_slots": 8,
+      "compressed_slots": 29,
+      "policy": "retain_full",
+      "kv_tokens": 262144,
+      "budget_bytes": 9877749760,
+      "staging_reserve_bytes": 412090368
+    },
+    "reuse": {
+      "baseline_slots": 24,
+      "compression": true,
+      "full_slots": 8,
+      "compressed_slots": 29,
+      "policy": "reuse",
+      "kv_tokens": 262144,
+      "budget_bytes": 9877749760,
+      "staging_reserve_bytes": 412090368
+    }
+  },
+  "repetitions": 3
+}
