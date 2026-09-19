@@ -1,0 +1,6 @@
+{
+  "state": "complete",
+  "measured_runs": 10,
+  "pilot_runs": 2,
+  "report": "/home/joshuaz/sglang/benchmark/mamba_pressure/results/race_fixed_20260919/report.md"
+}
