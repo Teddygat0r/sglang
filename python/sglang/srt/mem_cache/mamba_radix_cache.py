@@ -1019,7 +1019,14 @@ class MambaRadixCache(BasePrefixCache):
             f"head_dim={D}, state_size={S}. Max rank: {full_per_head // (D + 1 + S)}"
         )
 
-        num_compressed_slots = max(1, pool.size // 2)
+        explicit_slots = getattr(
+            get_global_server_args(), "mamba_svd_cache_size", None
+        )
+        num_compressed_slots = (
+            explicit_slots if explicit_slots is not None else max(1, pool.size // 2)
+        )
+        if num_compressed_slots <= 0:
+            raise ValueError("Compressed Mamba cache must have at least one slot")
         self.compressed_temporal = torch.empty(
             (num_compressed_slots, L, H, packed_per_head),
             dtype=temporal_dtype,
@@ -1039,6 +1046,7 @@ class MambaRadixCache(BasePrefixCache):
         self._pending_compression: Dict[int, TreeNode] = {}
         self._compression_queue: queue.Queue = queue.Queue()
         self._compression_done_queue: queue.Queue = queue.Queue()
+        self._compression_failed_queue: queue.Queue = queue.Queue()
         self._compression_stop_event = threading.Event()
         # Dedicated CUDA stream so SVD kernels overlap with inference instead
         # of serializing on the default stream.
@@ -1119,6 +1127,7 @@ class MambaRadixCache(BasePrefixCache):
         self._compressed_free_slots = list(range(self.compressed_temporal.shape[0]))
         self._drain_queue(self._compression_queue)
         self._drain_queue(self._compression_done_queue)
+        self._drain_queue(self._compression_failed_queue)
 
     @staticmethod
     def _drain_queue(q: queue.Queue) -> None:
@@ -1141,7 +1150,7 @@ class MambaRadixCache(BasePrefixCache):
         """Snapshot the node's full-rank state and post to the SVD worker.
 
         The snapshot clone is issued on the *SVD stream*, not the default
-        (inference) stream, so the ~50-100MB copy does not contend with decode.
+        (inference) stream. It can still contend with decode for GPU bandwidth.
         An event recorded on the current stream makes the SVD stream wait for
         the prefill write that produced this slot before it reads. The host
         cost of this method is just an event record plus a kernel launch on the
@@ -1165,6 +1174,10 @@ class MambaRadixCache(BasePrefixCache):
                 with torch.cuda.stream(self._svd_stream):
                     self._svd_stream.wait_event(event)
                     gpu_snapshot = src.clone()  # clone runs on the SVD stream
+                    # The event orders reads after writes, but does not protect
+                    # this temporary's allocation from reuse on its creator stream.
+                    # Keep its storage live until the asynchronous clone finishes.
+                    src.record_stream(self._svd_stream)
             else:
                 gpu_snapshot = src.clone()
         except Exception as e:
@@ -1210,11 +1223,15 @@ class MambaRadixCache(BasePrefixCache):
             batch = [item for item in batch if self._is_live_compression_item(item)]
             if not batch:
                 continue
+            pending_nodes = [(node_id, self._pending_compression.get(node_id)) for node_id, _ in batch]
             try:
                 self._process_compression_batch(batch)
             except Exception as e:
                 node_ids = [b[0] for b in batch]
                 logger.warning("Async SVD batch failed for nodes %s: %s", node_ids, e)
+                # Scheduler owns pending-state cleanup; preserve the full states.
+                for item in pending_nodes:
+                    self._compression_failed_queue.put(item)
 
     def _is_live_compression_item(self, item: Tuple[int, torch.Tensor]) -> bool:
         """Return whether a queued snapshot still belongs to a live radix node."""
@@ -1273,6 +1290,13 @@ class MambaRadixCache(BasePrefixCache):
             return
         pool = self.req_to_token_pool.mamba_pool
         rank = self.svd_rank
+        for _ in range(max_per_call):
+            try:
+                node_id, failed_node = self._compression_failed_queue.get_nowait()
+            except queue.Empty:
+                break
+            if failed_node is not None and self._pending_compression.get(node_id) is failed_node:
+                self._pending_compression.pop(node_id)
         for _ in range(max_per_call):
             try:
                 node_id, packed = self._compression_done_queue.get_nowait()

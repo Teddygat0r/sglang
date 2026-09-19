@@ -123,7 +123,9 @@ def summarize_requests(rows, duration, before, after, args):
 async def one_run(args, config, rep, directory, workload, discover=False):
     directory.mkdir(parents=True, exist_ok=False)
     base = f"http://127.0.0.1:{args.port}"
-    command = [sys.executable, str(HERE / "search_variant" / "server.py"),
+    native = config.get("native_allocation", False)
+    server = HERE / "server.py" if native else HERE / "search_variant" / "server.py"
+    command = [sys.executable, str(server),
         "--model-path", "Qwen/Qwen3.5-4B", "--port", str(args.port),
         "--host", "127.0.0.1", "--mem-fraction-static", "0.6",
         "--max-running-requests", str(args.concurrency), "--max-total-tokens", str(config["kv_tokens"]),
@@ -134,10 +136,16 @@ async def one_run(args, config, rep, directory, workload, discover=False):
     ]
     if config["compression"]:
         command += ["--mamba-svd-compression", "--mamba-svd-rank", "16"]
+    if native and config["compression"]:
+        command += [
+            "--mamba-svd-cache-size", str(config["compressed_slots"]),
+            "--mamba-svd-staging-reserve-bytes", str(config["staging_reserve_bytes"]),
+        ]
     env = dict(os.environ, CUDA_HOME="/usr/local/cuda", TRITON_PTXAS_PATH="/usr/local/cuda/bin/ptxas",
                HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
     env["PRESSURE_COMPRESSED_SLOTS"] = str(config.get("compressed_slots", 0))
     env["PRESSURE_POLICY"] = "lru"
+    env["PRESSURE_PRE_OPTIMIZATION"] = "1" if config.get("pre_optimization", False) else "0"
     env["PYTHONPATH"] = str(ROOT / "python") + os.pathsep + env.get("PYTHONPATH", "")
     save(directory / "command.json", {"command": command, "config": config, "repetition": rep})
     log = (directory / "server.log").open("w")
@@ -161,6 +169,14 @@ async def one_run(args, config, rep, directory, workload, discover=False):
                 await asyncio.sleep(2)
             initial = await observe(session, base)
             save(directory / "initial.json", initial)
+            if native:
+                if initial["kv_pool_bytes"] != config["kv_pool_bytes"]:
+                    raise RuntimeError("Native allocation changed the fixed KV pool size")
+                if initial["compressed_pool_bytes"] != config["compressed_slots"] * config["compressed_state_bytes"]:
+                    raise RuntimeError("Native compressed pool size differs from protocol")
+                if initial["persistent_cache_bytes"] + config["staging_reserve_bytes"] > config["budget_bytes"]:
+                    raise RuntimeError("Native allocation plus staging exceeds cache ceiling")
+                print(f"Startup verified: {directory.name}, native pools match protocol", flush=True)
             if discover:
                 return initial
             # Warm the same shape and decode path; use a disjoint prefix, then flush.

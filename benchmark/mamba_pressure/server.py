@@ -4,6 +4,11 @@ import os
 import sys
 from numbers import Integral
 
+if os.environ.get("PRESSURE_PRE_OPTIMIZATION") == "1":
+    from optimization_baseline import install as install_baseline
+
+    install_baseline()
+
 from instrumentation import install
 
 install()

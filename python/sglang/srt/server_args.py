@@ -550,6 +550,8 @@ class ServerArgs:
     mamba_svd_niter: int = 1
     mamba_svd_oversample: int = 4
     mamba_svd_worker_batch: int = 8
+    mamba_svd_cache_size: Optional[int] = None
+    mamba_svd_staging_reserve_bytes: int = 0
     mamba_ssm_dtype: Optional[str] = None
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
@@ -749,6 +751,10 @@ class ServerArgs:
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
         """
+
+        from sglang.srt.mem_cache.mamba_allocation import validate_explicit_allocation
+
+        validate_explicit_allocation(self)
 
         # Normalize load balancing defaults early (before dummy-model short-circuit).
         self._handle_load_balance_method()
@@ -5041,6 +5047,20 @@ class ServerArgs:
         )
 
         # Mamba Cache
+        parser.add_argument(
+            "--mamba-svd-cache-size",
+            type=int,
+            default=ServerArgs.mamba_svd_cache_size,
+            help="Explicit compressed Mamba slots per worker. Requires compression "
+            "and --max-mamba-cache-size. Unset preserves the legacy half-size pool.",
+        )
+        parser.add_argument(
+            "--mamba-svd-staging-reserve-bytes",
+            type=int,
+            default=ServerArgs.mamba_svd_staging_reserve_bytes,
+            help="Bytes reserved during memory profiling for asynchronous compression "
+            "staging. Requires explicit compressed sizing. Not a runtime queue cap.",
+        )
         parser.add_argument(
             "--mamba-svd-compression",
             action="store_true",
