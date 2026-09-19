@@ -1,0 +1,31 @@
+{
+  "staging_live_bytes": 251658240,
+  "staging_peak_bytes": 302186496,
+  "compression_enqueued": 192,
+  "compression_pending_peak": 7,
+  "compression_completed": 188,
+  "compression_committed": 188,
+  "kv_pool_bytes": 8589967360,
+  "mamba_pool_bytes": 875692032,
+  "full_state_bytes": 51511296,
+  "temporal_shape": [
+    24,
+    17,
+    32,
+    128,
+    128
+  ],
+  "temporal_element_bytes": 4,
+  "compressed_pool_bytes": 4944592896,
+  "full_state_slots": 16,
+  "compressed_slots": 358,
+  "full_free_slots": 12,
+  "compressed_entries": 188,
+  "compression_pending": 4,
+  "compression_queue_depth": 3,
+  "cuda_allocated_bytes": 24310497792,
+  "cuda_peak_allocated_bytes": 25603588096,
+  "persistent_cache_bytes": 14410252288,
+  "peak_cache_state_bytes": 14712438784,
+  "benchmark_variant": "singleton"
+}

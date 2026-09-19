@@ -1,0 +1,81 @@
+{
+  "all": {
+    "n": 16,
+    "means": {
+      "ttft_ms": 699.0791828138754,
+      "cache_lookup_host_ms": 1.3953532499999999,
+      "cache_lookup_gpu_span_ms": 0,
+      "restore_host_ms": 1.1243914375,
+      "restore_gpu_span_ms": 1.2372680008411407,
+      "forward_host_ms": 39.0036579375,
+      "forward_gpu_span_ms": 376.3840506076813,
+      "svd_host_overlap_ms": 442.178372,
+      "commit_loop_host_overlap_ms": 0.779311625,
+      "client_to_first_forward_ms": 326.215899875
+    }
+  },
+  "tail": {
+    "n": 2,
+    "means": {
+      "ttft_ms": 1598.777174949646,
+      "cache_lookup_host_ms": 0.11835999999999999,
+      "cache_lookup_gpu_span_ms": 0,
+      "restore_host_ms": 0.0,
+      "restore_gpu_span_ms": 0,
+      "forward_host_ms": 49.527402,
+      "forward_gpu_span_ms": 464.86255264282227,
+      "svd_host_overlap_ms": 1011.8534455,
+      "commit_loop_host_overlap_ms": 1.608045,
+      "client_to_first_forward_ms": 1151.713061
+    }
+  },
+  "non_tail": {
+    "n": 14,
+    "means": {
+      "ttft_ms": 570.550898223051,
+      "cache_lookup_host_ms": 1.577780857142857,
+      "cache_lookup_gpu_span_ms": 0,
+      "restore_host_ms": 1.2850187857142856,
+      "restore_gpu_span_ms": 1.414020572389875,
+      "forward_host_ms": 37.50026592857143,
+      "forward_gpu_span_ms": 363.74426460266113,
+      "svd_host_overlap_ms": 360.7962186428571,
+      "commit_loop_host_overlap_ms": 0.6609211428571429,
+      "client_to_first_forward_ms": 208.287734
+    }
+  },
+  "compressed": {
+    "n": 8,
+    "means": {
+      "ttft_ms": 137.97866832464933,
+      "cache_lookup_host_ms": 2.70524225,
+      "cache_lookup_gpu_span_ms": 0,
+      "restore_host_ms": 2.248782875,
+      "restore_gpu_span_ms": 2.4745360016822815,
+      "forward_host_ms": 25.0505485,
+      "forward_gpu_span_ms": 97.11501264572144,
+      "svd_host_overlap_ms": 95.919656875,
+      "commit_loop_host_overlap_ms": 0.731349875,
+      "client_to_first_forward_ms": 69.6885615
+    }
+  },
+  "full": {
+    "n": 0,
+    "means": {}
+  },
+  "miss": {
+    "n": 8,
+    "means": {
+      "ttft_ms": 1260.1796973031014,
+      "cache_lookup_host_ms": 0.08546424999999999,
+      "cache_lookup_gpu_span_ms": 0,
+      "restore_host_ms": 0.0,
+      "restore_gpu_span_ms": 0,
+      "forward_host_ms": 52.956767375,
+      "forward_gpu_span_ms": 655.6530885696411,
+      "svd_host_overlap_ms": 788.4370871250001,
+      "commit_loop_host_overlap_ms": 0.827273375,
+      "client_to_first_forward_ms": 582.74323825
+    }
+  }
+}

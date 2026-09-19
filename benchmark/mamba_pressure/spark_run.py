@@ -37,6 +37,7 @@ async def observe(session, base):
 
 
 async def request(session, base, tokens, output):
+    start_ns = time.monotonic_ns()
     start = time.perf_counter()
     first = last = None
     meta = None
@@ -65,6 +66,7 @@ async def request(session, base, tokens, output):
     if "cached_tokens" not in meta:
         raise RuntimeError(f"Missing request cache telemetry: {meta}")
     return {
+        "start_ns": start_ns, "first_ns": start_ns + int((first - start) * 1e9),
         "ttft_ms": (first - start) * 1000,
         "tpot_ms": (last - first) * 1000 / (output - 1),
         "latency_ms": (time.perf_counter() - start) * 1000,
@@ -121,10 +123,16 @@ def summarize_requests(rows, duration, before, after, args):
 
 
 async def one_run(args, config, rep, directory, workload, discover=False):
+    if config.get("admission", "eager") != "eager":
+        raise ValueError("Pressure admission has been retired; use eager compression")
+    if config.get("tail_profile") and not config.get("native_allocation"):
+        raise ValueError("Tail profiling requires the dedicated native profiling server")
     directory.mkdir(parents=True, exist_ok=False)
     base = f"http://127.0.0.1:{args.port}"
     native = config.get("native_allocation", False)
     server = HERE / "server.py" if native else HERE / "search_variant" / "server.py"
+    if config.get("tail_profile"):
+        server = HERE / "profile_server.py"
     command = [sys.executable, str(server),
         "--model-path", "Qwen/Qwen3.5-4B", "--port", str(args.port),
         "--host", "127.0.0.1", "--mem-fraction-static", "0.6",
@@ -147,6 +155,11 @@ async def one_run(args, config, rep, directory, workload, discover=False):
     env["PRESSURE_POLICY"] = "lru"
     env["PRESSURE_PRE_OPTIMIZATION"] = "1" if config.get("pre_optimization", False) else "0"
     env["PRESSURE_INDIVIDUAL_VARIANT"] = config.get("ablation", "baseline")
+    for key in ("PRESSURE_ADMISSION", "PRESSURE_LOW_WATERMARK", "PRESSURE_HIGH_WATERMARK"):
+        env.pop(key, None)
+    env.pop("PRESSURE_TAIL_PROFILE", None)
+    if config.get("tail_profile", False):
+        env["PRESSURE_TAIL_PROFILE"] = str(directory.resolve())
     env["PYTHONPATH"] = str(ROOT / "python") + os.pathsep + env.get("PYTHONPATH", "")
     save(directory / "command.json", {"command": command, "config": config, "repetition": rep})
     log = (directory / "server.log").open("w")
@@ -170,6 +183,8 @@ async def one_run(args, config, rep, directory, workload, discover=False):
                 await asyncio.sleep(2)
             initial = await observe(session, base)
             save(directory / "initial.json", initial)
+            if config.get("tail_profile") and not initial.get("tail_profile"):
+                raise RuntimeError("Tail profiling hooks not installed")
             if native:
                 if "ablation" in config and initial.get("benchmark_variant") != config["ablation"]:
                     raise RuntimeError("Server did not install the requested individual variant")
