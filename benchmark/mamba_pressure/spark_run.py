@@ -146,6 +146,7 @@ async def one_run(args, config, rep, directory, workload, discover=False):
     env["PRESSURE_COMPRESSED_SLOTS"] = str(config.get("compressed_slots", 0))
     env["PRESSURE_POLICY"] = "lru"
     env["PRESSURE_PRE_OPTIMIZATION"] = "1" if config.get("pre_optimization", False) else "0"
+    env["PRESSURE_INDIVIDUAL_VARIANT"] = config.get("ablation", "baseline")
     env["PYTHONPATH"] = str(ROOT / "python") + os.pathsep + env.get("PYTHONPATH", "")
     save(directory / "command.json", {"command": command, "config": config, "repetition": rep})
     log = (directory / "server.log").open("w")
@@ -170,6 +171,8 @@ async def one_run(args, config, rep, directory, workload, discover=False):
             initial = await observe(session, base)
             save(directory / "initial.json", initial)
             if native:
+                if "ablation" in config and initial.get("benchmark_variant") != config["ablation"]:
+                    raise RuntimeError("Server did not install the requested individual variant")
                 if initial["kv_pool_bytes"] != config["kv_pool_bytes"]:
                     raise RuntimeError("Native allocation changed the fixed KV pool size")
                 if initial["compressed_pool_bytes"] != config["compressed_slots"] * config["compressed_state_bytes"]:

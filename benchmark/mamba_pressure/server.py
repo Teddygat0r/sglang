@@ -11,6 +11,13 @@ if os.environ.get("PRESSURE_PRE_OPTIMIZATION") == "1":
 
 from instrumentation import install
 
+from individual_variant import install as install_variant
+
+_variant = os.environ.get("PRESSURE_INDIVIDUAL_VARIANT", "baseline")
+if os.environ.get("PRESSURE_PRE_OPTIMIZATION") == "1" and _variant != "baseline":
+    raise ValueError("Cannot combine frozen baseline overrides with individual variants")
+install_variant(_variant)
+
 install()
 
 # Pool byte-count helpers can return numpy integers; normalize at the API edge.
@@ -23,6 +30,7 @@ def get_internal_state(scheduler, request):
     result = _get_internal_state(scheduler, request)
     metrics = result.internal_state.get("cache_observations")
     if metrics is not None:
+        metrics["benchmark_variant"] = _variant
         result.internal_state["cache_observations"] = {
             key: int(value) if isinstance(value, Integral) else value
             for key, value in metrics.items()
