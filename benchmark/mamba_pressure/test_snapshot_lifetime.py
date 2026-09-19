@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 import torch
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+from sglang.srt.mem_cache.mamba_radix_cache import CompressionJob, MambaRadixCache
 
 
 def make_tree(device='cpu', shape=(2, 2, 2, 8, 8)):
@@ -20,6 +20,7 @@ def make_tree(device='cpu', shape=(2, 2, 2, 8, 8)):
     tree._compressed_free_slots = [0]
     tree._compressed_lru = {}
     tree._pending_compression = {}
+    tree._compression_jobs = {}
     tree._compression_queue = queue.Queue()
     tree._compression_done_queue = queue.Queue()
     tree._compression_failed_queue = queue.Queue()
@@ -41,15 +42,16 @@ class SnapshotLifetimeTests(unittest.TestCase):
             source = ast.parse(Path(module.__file__).read_text())
             cls = next(n for n in source.body if isinstance(n, ast.ClassDef) and n.name == item['cls'])
             method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == item['name'])
-            self.assertEqual(ast.dump(method), ast.dump(ast.parse(item['source']).body[0]))
+            # Job-token type annotations changed; numerical/restore bodies did not.
+            self.assertEqual([ast.dump(n) for n in method.body], [ast.dump(n) for n in ast.parse(item['source']).body[0].body])
 
     def test_cpu_snapshot_remains_independent(self):
         tree = make_tree()
         node = NS(id=1, mamba_value=torch.tensor([1]), mamba_compressed=False)
         tree._enqueue_compression(node)
         tree.req_to_token_pool.mamba_pool.mamba_cache.temporal.fill_(9)
-        node_id, snapshot = tree._compression_queue.get_nowait()
-        self.assertEqual(node_id, 1)
+        job, snapshot = tree._compression_queue.get_nowait()
+        self.assertEqual(job.node_id, 1)
         self.assertTrue((snapshot == 1).all())
         tree._enqueue_compression(node)
         self.assertTrue(tree._compression_queue.empty())
@@ -58,7 +60,9 @@ class SnapshotLifetimeTests(unittest.TestCase):
         tree = make_tree()
         node = NS(id=1, mamba_value=torch.tensor([1]), mamba_compressed=False)
         tree._pending_compression[1] = node
-        tree._compression_queue.put((1, torch.ones(2, 2, 8, 8)))
+        job = CompressionJob(1)
+        tree._compression_jobs[1] = job
+        tree._compression_queue.put((job, torch.ones(2, 2, 8, 8)))
         def fail(batch):
             tree._compression_stop_event.set()
             raise RuntimeError('injected SVD failure')
@@ -77,7 +81,8 @@ class SnapshotLifetimeTests(unittest.TestCase):
         tree = make_tree()
         old, new = object(), object()
         tree._pending_compression[1] = new
-        tree._compression_failed_queue.put((1, old))
+        tree._compression_jobs[1] = CompressionJob(1)
+        tree._compression_failed_queue.put(CompressionJob(1))
         tree.drain_compression_completions()
         self.assertIs(tree._pending_compression[1], new)
 

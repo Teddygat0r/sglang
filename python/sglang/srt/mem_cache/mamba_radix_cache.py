@@ -23,6 +23,7 @@ import heapq
 import queue
 import threading
 from collections import OrderedDict, defaultdict
+from dataclasses import dataclass, field
 from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -64,6 +65,14 @@ if TYPE_CHECKING:
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, eq=False)
+class CompressionJob:
+    """Unique state-version token; workers see no mutable radix-tree metadata."""
+
+    node_id: int
+    cancelled: threading.Event = field(default_factory=threading.Event)
 
 
 class TreeNode:
@@ -1044,6 +1053,7 @@ class MambaRadixCache(BasePrefixCache):
         self._compressed_free_slots: List[int] = list(range(num_compressed_slots))
         self._compressed_lru: "OrderedDict[int, TreeNode]" = OrderedDict()
         self._pending_compression: Dict[int, TreeNode] = {}
+        self._compression_jobs: Dict[int, CompressionJob] = {}
         self._compression_queue: queue.Queue = queue.Queue()
         self._compression_done_queue: queue.Queue = queue.Queue()
         self._compression_failed_queue: queue.Queue = queue.Queue()
@@ -1122,6 +1132,9 @@ class MambaRadixCache(BasePrefixCache):
 
     def _reset_compression_state(self) -> None:
         """Drop async SVD work and restore the compressed pool to an empty state."""
+        for job in self._compression_jobs.values():
+            job.cancelled.set()
+        self._compression_jobs.clear()
         self._pending_compression.clear()
         self._compressed_lru.clear()
         self._compressed_free_slots = list(range(self.compressed_temporal.shape[0]))
@@ -1184,8 +1197,25 @@ class MambaRadixCache(BasePrefixCache):
             logger.warning("Failed to snapshot mamba state for node %s: %s", node.id, e)
             return
 
+        job = CompressionJob(node.id)
         self._pending_compression[node.id] = node
-        self._compression_queue.put((node.id, gpu_snapshot))
+        self._compression_jobs[node.id] = job
+        self._compression_queue.put((job, gpu_snapshot))
+
+    def _invalidate_compression(self, node_id: int) -> None:
+        """Scheduler-only cancellation; does not wait for GPU work or pin a slot."""
+        job = self._compression_jobs.pop(node_id, None)
+        if job is not None:
+            job.cancelled.set()
+        self._pending_compression.pop(node_id, None)
+
+    def _take_compression_result(self, job: CompressionJob) -> Optional[TreeNode]:
+        """Accept a result only for the exact currently pending state version."""
+        if job.cancelled.is_set() or self._compression_jobs.get(job.node_id) is not job:
+            return None
+        node = self._pending_compression.get(job.node_id)
+        self._invalidate_compression(job.node_id)
+        return node
 
     def _compression_worker(self) -> None:
         """Background daemon thread: pops GPU snapshots, runs a single *batched*
@@ -1223,31 +1253,20 @@ class MambaRadixCache(BasePrefixCache):
             batch = [item for item in batch if self._is_live_compression_item(item)]
             if not batch:
                 continue
-            pending_nodes = [(node_id, self._pending_compression.get(node_id)) for node_id, _ in batch]
             try:
                 self._process_compression_batch(batch)
             except Exception as e:
-                node_ids = [b[0] for b in batch]
+                node_ids = [b[0].node_id for b in batch]
                 logger.warning("Async SVD batch failed for nodes %s: %s", node_ids, e)
                 # Scheduler owns pending-state cleanup; preserve the full states.
-                for item in pending_nodes:
-                    self._compression_failed_queue.put(item)
+                for job, _ in batch:
+                    self._compression_failed_queue.put(job)
 
-    def _is_live_compression_item(self, item: Tuple[int, torch.Tensor]) -> bool:
-        """Return whether a queued snapshot still belongs to a live radix node."""
-        node_id, _ = item
-        node = self._pending_compression.get(node_id)
-        if node is None:
-            return False
-        if node.mamba_value is None or node.mamba_compressed:
-            self._pending_compression.pop(node_id, None)
-            return False
-        if not self._is_live_compression_node(node):
-            self._pending_compression.pop(node_id, None)
-            return False
-        return True
+    def _is_live_compression_item(self, item: Tuple[CompressionJob, torch.Tensor]) -> bool:
+        """Worker cancellation check; never read or mutate tree/pending metadata."""
+        return not item[0].cancelled.is_set()
 
-    def _process_compression_batch(self, batch: List[Tuple[int, torch.Tensor]]) -> None:
+    def _process_compression_batch(self, batch: List[Tuple[CompressionJob, torch.Tensor]]) -> None:
         """Run one batched SVD over `batch` snapshots and post packed results."""
         rank = self.svd_rank
         node_ids = [b[0] for b in batch]
@@ -1292,17 +1311,16 @@ class MambaRadixCache(BasePrefixCache):
         rank = self.svd_rank
         for _ in range(max_per_call):
             try:
-                node_id, failed_node = self._compression_failed_queue.get_nowait()
+                failed_job = self._compression_failed_queue.get_nowait()
             except queue.Empty:
                 break
-            if failed_node is not None and self._pending_compression.get(node_id) is failed_node:
-                self._pending_compression.pop(node_id)
+            self._take_compression_result(failed_job)
         for _ in range(max_per_call):
             try:
-                node_id, packed = self._compression_done_queue.get_nowait()
+                job, packed = self._compression_done_queue.get_nowait()
             except queue.Empty:
                 return
-            node = self._pending_compression.pop(node_id, None)
+            node = self._take_compression_result(job)
             if node is None:
                 continue
             if (
@@ -1323,6 +1341,10 @@ class MambaRadixCache(BasePrefixCache):
             # 1. Write compressed temporal + conv to the new compressed slot.
             # `packed` already lives on the same CUDA device as compressed_temporal
             # (produced by the GPU SVD worker); .to() is a dtype cast only.
+            # Result storage was allocated on the SVD stream. Protect that
+            # allocation until the inference-stream copy (or cast) has finished.
+            if packed.is_cuda:
+                packed.record_stream(torch.cuda.current_stream(packed.device))
             self.compressed_temporal[c_slot].copy_(
                 packed.to(dtype=self.compressed_temporal.dtype)
             )
@@ -1399,6 +1421,8 @@ class MambaRadixCache(BasePrefixCache):
 
     def _free_mamba_state(self, node: TreeNode) -> None:
         """Dispatcher: release a node's mamba state (compressed or full-rank)."""
+        if self.enable_svd_compression:
+            self._invalidate_compression(node.id)
         if node.mamba_compressed:
             if node.compressed_slot is not None:
                 self._compressed_free_slots.append(node.compressed_slot)
@@ -1721,6 +1745,8 @@ class MambaRadixCache(BasePrefixCache):
 
     def _tombstone_internal_node(self, node: TreeNode) -> None:
         assert len(node.children) != 0, f"Cannot tombstone a leaf node, {node.id=}"
+        if self.enable_svd_compression:
+            self._invalidate_compression(node.id)
         self.mamba_evictable_size_ -= len(node.mamba_value)
         node.mamba_value = None
         node.mamba_compressed = False
