@@ -123,6 +123,16 @@ def summarize_requests(rows, duration, before, after, args):
 
 
 async def one_run(args, config, rep, directory, workload, discover=False):
+    production_defaults = config.get("production_defaults", False)
+    expected_cap = config.get("expected_svd_worker_batch", config.get("svd_worker_batch"))
+    if production_defaults and (config.get("defer_prefill") or config.get("tail_profile") or "svd_worker_batch" in config):
+        raise ValueError("Production comparison must use native defaults without experimental overrides")
+    if config.get("defer_prefill") and (not config.get("native_allocation") or config.get("tail_profile") or "svd_worker_batch" not in config):
+        raise ValueError("Deferral test requires native allocation, an explicit batch cap, and profiling disabled")
+    if config.get("prefill_gate"):
+        raise ValueError("Prefill synchronization experiment has been retired")
+    if "svd_worker_batch" in config and (type(config["svd_worker_batch"]) is not int or config["svd_worker_batch"] < 1 or not config["compression"]):
+        raise ValueError("SVD worker batch must be a positive integer with compression enabled")
     if config.get("admission", "eager") != "eager":
         raise ValueError("Pressure admission has been retired; use eager compression")
     if config.get("tail_profile") and not config.get("native_allocation"):
@@ -133,6 +143,8 @@ async def one_run(args, config, rep, directory, workload, discover=False):
     server = HERE / "server.py" if native else HERE / "search_variant" / "server.py"
     if config.get("tail_profile"):
         server = HERE / "profile_server.py"
+    if config.get("defer_prefill"):
+        server = HERE / "defer_server.py"
     command = [sys.executable, str(server),
         "--model-path", "Qwen/Qwen3.5-4B", "--port", str(args.port),
         "--host", "127.0.0.1", "--mem-fraction-static", "0.6",
@@ -144,6 +156,13 @@ async def one_run(args, config, rep, directory, workload, discover=False):
     ]
     if config["compression"]:
         command += ["--mamba-svd-compression", "--mamba-svd-rank", "16"]
+        if not production_defaults:
+            # Historical experiment launchers explicitly retain their old policy.
+            command += ["--disable-mamba-svd-prefill-deferral"]
+            if "svd_worker_batch" not in config:
+                command += ["--mamba-svd-worker-batch", "8"]
+    if "svd_worker_batch" in config:
+        command += ["--mamba-svd-worker-batch", str(config["svd_worker_batch"])]
     if native and config["compression"]:
         command += [
             "--mamba-svd-cache-size", str(config["compressed_slots"]),
@@ -158,6 +177,7 @@ async def one_run(args, config, rep, directory, workload, discover=False):
     for key in ("PRESSURE_ADMISSION", "PRESSURE_LOW_WATERMARK", "PRESSURE_HIGH_WATERMARK"):
         env.pop(key, None)
     env.pop("PRESSURE_TAIL_PROFILE", None)
+    env.pop("PRESSURE_PREFILL_GATE", None)
     if config.get("tail_profile", False):
         env["PRESSURE_TAIL_PROFILE"] = str(directory.resolve())
     env["PYTHONPATH"] = str(ROOT / "python") + os.pathsep + env.get("PYTHONPATH", "")
@@ -183,6 +203,11 @@ async def one_run(args, config, rep, directory, workload, discover=False):
                 await asyncio.sleep(2)
             initial = await observe(session, base)
             save(directory / "initial.json", initial)
+            expected_deferral = bool(config.get("defer_prefill") or (production_defaults and config["compression"]))
+            if bool(initial.get("defer_prefill")) != expected_deferral:
+                raise RuntimeError("Prefill deferral mode differs from protocol")
+            if expected_cap is not None and initial.get("svd_worker_batch") != expected_cap:
+                raise RuntimeError("SVD worker batch does not match protocol")
             if config.get("tail_profile") and not initial.get("tail_profile"):
                 raise RuntimeError("Tail profiling hooks not installed")
             if native:
@@ -234,6 +259,14 @@ async def one_run(args, config, rep, directory, workload, discover=False):
             after = await observe(session, base)
             save(directory / "after.json", after)
             metrics = summarize_requests(rows, duration, before, after, args)
+            for key in ("prefill_deferred_batches", "prefill_deferral_wait_ms"):
+                metrics[key] = after.get(key, 0) - before.get(key, 0)
+            if expected_cap is not None:
+                batches = after.get("svd_batches", 0) - before.get("svd_batches", 0)
+                items = after.get("svd_batch_items", 0) - before.get("svd_batch_items", 0)
+                metrics.update(svd_batches=batches, svd_batch_items=items,
+                               svd_batch_mean=items / batches if batches else 0,
+                               svd_batch_max=after.get("svd_batch_max", 0))
             validation = {
                 "all_requests_completed": len(rows) == len(workload),
                 "within_cache_budget": after["peak_cache_state_bytes"] <= config["budget_bytes"],
@@ -246,6 +279,11 @@ async def one_run(args, config, rep, directory, workload, discover=False):
                 "no_compression_failures": metrics["compression_failed"] == 0,
             }
             result = {"config": config, "repetition": rep, "metrics": metrics, "validation": validation}
+            if expected_cap is not None:
+                validation["svd_batches_observed"] = metrics["svd_batches"] > 0
+                validation["svd_batch_limit_respected"] = metrics["svd_batch_max"] <= expected_cap
+            if production_defaults and config["compression"]:
+                validation["deferral_exercised"] = metrics["prefill_deferred_batches"] > 0
             save(directory / "result.json", result)
             if not all(v for v in validation.values() if v is not None):
                 raise RuntimeError(f"Run validation failed: {validation}")

@@ -471,7 +471,32 @@ class MambaRadixCache(BasePrefixCache):
         # Greedy worker batch cap: how many pending snapshots to fold into one
         # batched SVD call. Larger amortizes kernel launches; bounded so a burst
         # of completions can't build an unboundedly large transient tensor.
-        self.svd_worker_batch = getattr(server_args, "mamba_svd_worker_batch", 8)
+        self.svd_worker_batch = getattr(server_args, "mamba_svd_worker_batch", 2)
+        if self.svd_worker_batch < 1:
+            raise ValueError("mamba_svd_worker_batch must be positive")
+        self.compression_admission = None
+        if self.enable_svd_compression and not getattr(
+            server_args, "disable_mamba_svd_prefill_deferral", False
+        ):
+            # Other scheduler modes need their own completion/admission wiring.
+            supported = (
+                torch.device(self.device).type == "cuda"
+                and getattr(server_args, "pp_size", 1) == 1
+                and getattr(server_args, "disaggregation_mode", "null") == "null"
+                and not getattr(server_args, "speculative_algorithm", None)
+                and not getattr(server_args, "dllm_algorithm", None)
+                and not getattr(server_args, "enable_pdmux", False)
+            )
+            if supported:
+                from sglang.srt.mem_cache.compression_admission import CompressionAdmission
+
+                self.compression_admission = CompressionAdmission()
+            else:
+                logger.warning(
+                    "Mamba SVD prefill deferral requires CUDA, PP=1, standard "
+                    "autoregressive scheduling without disaggregation, PDMux or "
+                    "speculative decoding; using eager SVD admission."
+                )
         self._compression_thread: Optional[threading.Thread] = None
         self._compression_stop_event: Optional[threading.Event] = None
         if self.enable_svd_compression and self.req_to_token_pool.mamba_pool is not None:
@@ -1250,6 +1275,16 @@ class MambaRadixCache(BasePrefixCache):
                     batch.append(nxt)
             # A queued snapshot can outlive its radix node. Filter stale work
             # before launching SVD so evicted nodes do not consume GPU time.
+            batch = [item for item in batch if self._is_live_compression_item(item)]
+            if not batch:
+                continue
+            admission = getattr(self, "compression_admission", None)
+            if admission is not None and not admission.wait(
+                stop_event,
+                cancelled=lambda: all(item[0].cancelled.is_set() for item in batch),
+            ):
+                continue
+            # Eviction/reset can cancel work while admission is deferred.
             batch = [item for item in batch if self._is_live_compression_item(item)]
             if not batch:
                 continue

@@ -104,6 +104,9 @@ def install():
     original_batch = MambaRadixCache._process_compression_batch
 
     def batch(tree, items):
+        tree._pressure["svd_batches"] += 1
+        tree._pressure["svd_batch_items"] += len(items)
+        tree._pressure["svd_batch_max"] = max(tree._pressure["svd_batch_max"], len(items))
         try:
             return original_batch(tree, items)
         except Exception:
@@ -142,7 +145,12 @@ def install():
                                    [tree.compressed_temporal, *tree.compressed_conv])
         with tree._pressure_lock:
             metrics = dict(tree._pressure)
+        admission = getattr(tree, "compression_admission", None)
+        metrics["defer_prefill"] = admission is not None
+        if admission is not None:
+            metrics.update(admission.metrics())
         metrics.update(
+            svd_worker_batch=tree.svd_worker_batch if tree.enable_svd_compression else 0,
             kv_pool_bytes=kv_bytes, mamba_pool_bytes=state_bytes,
             full_state_bytes=state_bytes // (pool.size + 1),
             temporal_shape=list(pool.mamba_cache.temporal.shape),

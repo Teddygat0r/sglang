@@ -102,7 +102,7 @@ async def experiment(root):
     save(root / 'status.json', dict(state='complete', completed=completed, report=str(root / 'report.md')))
 
 
-def main():
+def main(run_experiment=experiment, launcher_file=__file__):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--results', type=Path, required=True)
     parser.add_argument('--launch', action='store_true')
@@ -111,14 +111,14 @@ def main():
     if args.launch:
         root.mkdir(parents=True, exist_ok=False)
         with (root / 'supervisor.log').open('w') as log, open(os.devnull) as stdin:
-            proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--results', str(root)],
+            proc = subprocess.Popen([sys.executable, str(Path(launcher_file).resolve()), '--results', str(root)],
                                     cwd=Path(__file__).resolve().parents[2], stdin=stdin,
                                     stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         save(root / 'supervisor.json', dict(pid=proc.pid, started_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())))
         print(json.dumps(dict(pid=proc.pid, results=str(root))))
         return
     try:
-        asyncio.run(experiment(root))
+        asyncio.run(run_experiment(root))
     except BaseException as error:
         prior = json.loads((root / 'status.json').read_text()) if (root / 'status.json').exists() else {}
         save(root / 'status.json', {**prior, 'state': 'failed', 'error': repr(error)})

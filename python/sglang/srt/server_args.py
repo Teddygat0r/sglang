@@ -549,7 +549,8 @@ class ServerArgs:
     mamba_svd_rank: int = 16
     mamba_svd_niter: int = 1
     mamba_svd_oversample: int = 4
-    mamba_svd_worker_batch: int = 8
+    mamba_svd_worker_batch: int = 2
+    disable_mamba_svd_prefill_deferral: bool = False
     mamba_svd_cache_size: Optional[int] = None
     mamba_svd_staging_reserve_bytes: int = 0
     mamba_ssm_dtype: Optional[str] = None
@@ -5093,6 +5094,12 @@ class ServerArgs:
             default=ServerArgs.mamba_svd_worker_batch,
             help="Max pending mamba-state snapshots folded into one batched SVD "
             "call by the async worker. Larger amortizes kernel-launch overhead.",
+        )
+        parser.add_argument(
+            "--disable-mamba-svd-prefill-deferral",
+            action="store_true",
+            help="Allow new background Mamba SVD batches while prefill is pending. "
+            "By default, defer new batches without blocking prefill or stopping in-flight SVD.",
         )
         parser.add_argument(
             "--max-mamba-cache-size",

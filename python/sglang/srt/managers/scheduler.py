@@ -806,6 +806,8 @@ class Scheduler(
         if server_args.enable_streaming_session:
             self.tree_cache = SessionAwareCache(self.tree_cache)
 
+        self.compression_admission = getattr(self.tree_cache, "compression_admission", None)
+
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
@@ -1582,6 +1584,15 @@ class Scheduler(
                         self.recv_from_rpc.send_pyobj(output)
 
         self._check_pending_flush()
+        self._refresh_compression_admission()
+
+    def _refresh_compression_admission(self, selected: Optional[bool] = None) -> None:
+        admission = getattr(self, "compression_admission", None)
+        if admission is not None:
+            admission.refresh(
+                waiting=bool(self.waiting_queue) or self.chunked_req is not None,
+                selected=selected,
+            )
 
     def init_req_max_new_tokens(self, req):
         req.sampling_params.max_new_tokens = min(
@@ -2146,6 +2157,7 @@ class Scheduler(
         return batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        self._refresh_compression_admission()
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout()
         if self.dllm_config is not None:
@@ -2250,6 +2262,12 @@ class Scheduler(
         if ret:
             set_schedule_time_batch(ret)
 
+        self._refresh_compression_admission(
+            selected=(
+                ret is not None
+                and ret.forward_mode.is_extend_or_draft_extend_or_mixed()
+            )
+        )
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
@@ -2607,6 +2625,35 @@ class Scheduler(
         self.batch_record_buf[self.batch_record_ct] = model_worker_batch
 
     def run_batch(
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
+        admission = getattr(self, "compression_admission", None)
+        prefill = (
+            admission is not None
+            and batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+        )
+        if prefill:
+            admission.begin_prefill()
+        try:
+            return self._run_batch_impl(batch, pp_proxy_tensors)
+        finally:
+            if prefill:
+                # Overlap mode submits forward on a different stream. Recording
+                # on the scheduler stream would incorrectly resume SVD early.
+                stream = (
+                    self.forward_stream
+                    if self.enable_overlap
+                    else torch.cuda.current_stream()
+                )
+                event = torch.cuda.Event()
+                event.record(stream)
+                admission.finish_prefill(event)
+            if admission is not None:
+                self._refresh_compression_admission()
+
+    def _run_batch_impl(
         self,
         batch: ScheduleBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
@@ -3081,6 +3128,11 @@ class Scheduler(
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        admission = getattr(self, "compression_admission", None)
+        ret["mamba_svd_admission"] = {
+            "prefill_deferral_active": admission is not None,
+            **(admission.metrics() if admission is not None else {}),
+        }
 
         if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
             ret["avg_spec_accept_length"] = (
