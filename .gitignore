@@ -272,3 +272,9 @@ sgl-kernel/csrc/**/*_musa/
 *.glb
 *.ply
 *.npz
+
+# Local Mamba compression experiment artifacts
+/ordered_svd_*/
+/sglang_*_generated-shared-prefix.jsonl
+/changes.diff
+/env.sh

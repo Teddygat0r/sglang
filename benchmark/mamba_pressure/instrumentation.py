@@ -7,8 +7,8 @@ from collections import OrderedDict, defaultdict
 
 def install():
     import torch
-    from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 
     if getattr(MambaRadixCache, "_pressure_instrumented", False):
         return
@@ -27,7 +27,9 @@ def install():
             tree._pressure_storages[key] = size
             tree._pressure["staging_live_bytes"] += size
             tree._pressure["staging_peak_bytes"] = max(
-                tree._pressure["staging_peak_bytes"], tree._pressure["staging_live_bytes"])
+                tree._pressure["staging_peak_bytes"],
+                tree._pressure["staging_live_bytes"],
+            )
 
         def release():
             with tree._pressure_lock:
@@ -49,8 +51,10 @@ def install():
                 super().__setitem__(key, value)
 
         tree._compressed_lru = ObservedLRU(tree._compressed_lru)
-        for name, counter in [("_compression_queue", "compression_enqueued"),
-                              ("_compression_done_queue", "compression_completed")]:
+        for name, counter in [
+            ("_compression_queue", "compression_enqueued"),
+            ("_compression_done_queue", "compression_completed"),
+        ]:
             queue = getattr(tree, name)
             original_put = queue.put
 
@@ -59,7 +63,9 @@ def install():
                     track(tree, item[1])
                     tree._pressure[_counter] += 1
                     tree._pressure["compression_pending_peak"] = max(
-                        tree._pressure["compression_pending_peak"], len(tree._pending_compression))
+                        tree._pressure["compression_pending_peak"],
+                        len(tree._pending_compression),
+                    )
                 return _put(item, *a, **kw)
 
             queue.put = put
@@ -86,7 +92,10 @@ def install():
     def free_state(tree, node):
         if node.mamba_compressed and node.children:
             parent = node.parent
-            if parent is not None and parent.children.get(tree.get_child_key_fn(node.key)) is node:
+            if (
+                parent is not None
+                and parent.children.get(tree.get_child_key_fn(node.key)) is node
+            ):
                 tree._pressure["evicted_entries"] += 1
                 tree._pressure["evicted_compressed_entries"] += 1
 
@@ -106,7 +115,9 @@ def install():
     def batch(tree, items):
         tree._pressure["svd_batches"] += 1
         tree._pressure["svd_batch_items"] += len(items)
-        tree._pressure["svd_batch_max"] = max(tree._pressure["svd_batch_max"], len(items))
+        tree._pressure["svd_batch_max"] = max(
+            tree._pressure["svd_batch_max"], len(items)
+        )
         try:
             return original_batch(tree, items)
         except Exception:
@@ -141,8 +152,10 @@ def install():
         state_bytes = pool.mamba_cache.mem_usage_bytes()
         compressed_bytes = 0
         if tree.enable_svd_compression:
-            compressed_bytes = sum(t.numel() * t.element_size() for t in
-                                   [tree.compressed_temporal, *tree.compressed_conv])
+            compressed_bytes = sum(
+                t.numel() * t.element_size()
+                for t in [tree.compressed_temporal, *tree.compressed_conv]
+            )
         with tree._pressure_lock:
             metrics = dict(tree._pressure)
         admission = getattr(tree, "compression_admission", None)
@@ -150,22 +163,36 @@ def install():
         if admission is not None:
             metrics.update(admission.metrics())
         metrics.update(
-            svd_worker_batch=tree.svd_worker_batch if tree.enable_svd_compression else 0,
-            kv_pool_bytes=kv_bytes, mamba_pool_bytes=state_bytes,
+            svd_worker_batch=tree.svd_worker_batch
+            if tree.enable_svd_compression
+            else 0,
+            kv_pool_bytes=kv_bytes,
+            mamba_pool_bytes=state_bytes,
             full_state_bytes=state_bytes // (pool.size + 1),
             temporal_shape=list(pool.mamba_cache.temporal.shape),
             temporal_element_bytes=pool.mamba_cache.temporal.element_size(),
-            compressed_pool_bytes=compressed_bytes, full_state_slots=pool.size,
-            compressed_slots=tree.compressed_temporal.shape[0] if tree.enable_svd_compression else 0,
+            compressed_pool_bytes=compressed_bytes,
+            full_state_slots=pool.size,
+            compressed_slots=tree.compressed_temporal.shape[0]
+            if tree.enable_svd_compression
+            else 0,
             full_free_slots=int(pool.available_size()),
-            compressed_entries=len(tree._compressed_lru) if tree.enable_svd_compression else 0,
-            compression_pending=len(tree._pending_compression) if tree.enable_svd_compression else 0,
-            compression_queue_depth=tree._compression_queue.qsize() if tree.enable_svd_compression else 0,
+            compressed_entries=len(tree._compressed_lru)
+            if tree.enable_svd_compression
+            else 0,
+            compression_pending=len(tree._pending_compression)
+            if tree.enable_svd_compression
+            else 0,
+            compression_queue_depth=tree._compression_queue.qsize()
+            if tree.enable_svd_compression
+            else 0,
             cuda_allocated_bytes=torch.cuda.memory_allocated(tree.device),
             cuda_peak_allocated_bytes=torch.cuda.max_memory_allocated(tree.device),
         )
         metrics["persistent_cache_bytes"] = kv_bytes + state_bytes + compressed_bytes
-        metrics["peak_cache_state_bytes"] = metrics["persistent_cache_bytes"] + metrics.get("staging_peak_bytes", 0)
+        metrics["peak_cache_state_bytes"] = metrics[
+            "persistent_cache_bytes"
+        ] + metrics.get("staging_peak_bytes", 0)
         result.internal_state = {**result.internal_state, "cache_observations": metrics}
         return result
 

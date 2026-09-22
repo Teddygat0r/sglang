@@ -1,5 +1,9 @@
-# Large raw inputs and ephemeral process IDs stay in the local evidence archive.
-results/**/trace*.json
-results/**/pid.json
-results/**/supervisor.json
+# Experimental inputs and outputs belong outside the source repository.
+results/
 artifacts/
+*.json
+*.jsonl
+*.csv
+*.log
+*.png
+*.pdf

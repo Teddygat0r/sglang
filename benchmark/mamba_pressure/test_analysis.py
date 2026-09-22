@@ -1,9 +1,9 @@
 """Small checks for trace pairing and metric definitions."""
 
-from argparse import Namespace
 import unittest
+from argparse import Namespace
 
-from run import summarize_requests, trace
+from spark_run import summarize_requests, trace
 
 
 class AnalysisTests(unittest.TestCase):
@@ -15,20 +15,34 @@ class AnalysisTests(unittest.TestCase):
         for group in range(args.groups):
             requests = [r for r in first if r["group"] == group]
             self.assertEqual(len(requests), 3)
-            self.assertEqual(len({tuple(r["tokens"][:args.prefix]) for r in requests}), 1)
+            self.assertEqual(
+                len({tuple(r["tokens"][: args.prefix]) for r in requests}), 1
+            )
             self.assertEqual(len({r["tokens"][args.prefix] for r in requests}), 3)
 
     def test_recomputation_excludes_compulsory_first_access(self):
         args = Namespace(prefix=100)
-        rows = [dict(cached_tokens=cached, round=round_index, input_tokens=110,
-                     output_tokens=8, ttft_ms=ttft, tpot_ms=5)
-                for cached, round_index, ttft in [(0, 0, 30), (100, 1, 10), (40, 2, 20)]]
+        rows = [
+            dict(
+                cached_tokens=cached,
+                round=round_index,
+                input_tokens=110,
+                output_tokens=8,
+                ttft_ms=ttft,
+                tpot_ms=5,
+            )
+            for cached, round_index, ttft in [(0, 0, 30), (100, 1, 10), (40, 2, 20)]
+        ]
         before = {"evicted_entries": 7}
-        after = dict(evicted_entries=9, persistent_cache_bytes=1024,
-                     peak_cache_state_bytes=2048, cuda_peak_allocated_bytes=4096)
+        after = dict(
+            evicted_entries=9,
+            persistent_cache_bytes=1024,
+            peak_cache_state_bytes=2048,
+            cuda_peak_allocated_bytes=4096,
+        )
         result = summarize_requests(rows, 2, before, after, args)
         self.assertEqual(result["recomputed_prefix_tokens"], 60)
-        self.assertAlmostEqual(result["token_cache_hit_rate"], 140/330)
+        self.assertAlmostEqual(result["token_cache_hit_rate"], 140 / 330)
         self.assertEqual(result["evicted_entries"], 2)
         self.assertEqual(result["request_throughput_rps"], 1.5)
         self.assertEqual(result["output_throughput_tps"], 12)

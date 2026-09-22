@@ -5,10 +5,8 @@ import subprocess
 from argparse import Namespace
 from pathlib import Path
 
-from allocation_native import configs
-from batch_sweep import summarize
+from benchmark_utils import configs, main, summarize
 from spark_run import ROOT, one_run, save, trace
-from tail_sweep import main
 
 
 async def experiment(root):

@@ -1,9 +1,9 @@
 """CPU checks for queued-storage accounting, without loading a model."""
 
-from collections import OrderedDict
 import gc
 import queue
 import unittest
+from collections import OrderedDict
 
 import torch
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache

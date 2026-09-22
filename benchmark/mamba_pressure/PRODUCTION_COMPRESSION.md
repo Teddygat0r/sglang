@@ -22,22 +22,24 @@ Two-process Gloo tests use sharded CPU state and exercise unequal completion tim
 
 ## Matched comparison
 
-`production_compare.py` uses ordinary benchmark `server.py` only for measurement telemetry; policies come from the production scheduler/cache and CLI defaults. No `defer_server.py`, `profile_server.py`, cap override or deferral opt-out. Startup verifies effective cap2, deferral enabled only in the on arm, exact pools and fixed memory ceiling. Full runs also require observed deferrals and valid actual batch caps.
+`production_compare.py` uses ordinary benchmark `server.py` only for measurement telemetry; policies come from the production scheduler/cache and CLI defaults. The comparison uses native compression defaults. Startup verifies effective cap2, deferral enabled only in the on arm, exact pools and fixed memory ceiling. Full runs also require observed deferrals and valid actual batch caps.
 
 Qwen3.5-4B rank16, concurrency4; ~14.19 GiB total cache ceiling; KV262144 tokens. Off: full128. On: full32/compressed298 with the same prior staging allowance. 64 shared prefixes × three passes, 2048+16 input, 128 output; five fresh paired seeds, alternate order, two excluded pilots. Model weights/allocator workspace are outside the cache ceiling. Report all existing metrics, per-arm mean/95% CI and paired on-minus-off differences. A CI containing zero does not establish equivalent P95; no equivalence margin is claimed.
 
 ```
-.venv/bin/python benchmark/mamba_pressure/production_compare.py --launch --results benchmark/mamba_pressure/results/production_TIMESTAMP
+.venv/bin/python benchmark/mamba_pressure/production_compare.py --launch --geometry /data/mamba/geometry.json --results /data/mamba/production-run
 ```
 
 12 runs; approximately 1–1.5 hours. Detached status.json/supervisor.log/report.md/summary.json. Stop on validation failure. Results from earlier policy experiments remain unchanged.
 
 ## Regression checks
 
-Application tests live under `test/registered/unit/mem_cache/test_mamba_compression_*.py` and `test_mamba_svd_compression.py`, with CI registration. Historical test entrypoints in this benchmark directory forward to those tests. For a local CUDA check from the repository root:
+Application tests live under `test/registered/unit/mem_cache/test_mamba_compression_*.py` and `test_mamba_svd_compression.py`, with CI registration. For a local CUDA check from the repository root:
 
 ```sh
 PYTHONPATH=python:test/registered/unit/mem_cache .venv/bin/python -m unittest discover -s test/registered/unit/mem_cache -p 'test_mamba*.py'
 ```
 
-These implementation fixes have unit and CUDA cache coverage. The saved serving comparisons above predate bounded staging and have not been rerun for the new implementation.
+These implementation fixes have unit and CUDA cache coverage. Historical serving results are in the external archive described in README.md. They predate bounded staging and have not been rerun for the new implementation.
+
+All generated data and reports belong outside Git; see [README.md](README.md) for inputs, launch instructions and archive policy.

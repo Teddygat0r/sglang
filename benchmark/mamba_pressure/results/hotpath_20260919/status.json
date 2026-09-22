@@ -1,9 +1,0 @@
-{
-  "state": "failed",
-  "phase": "full",
-  "run": "f16_after_r1",
-  "completed_measured_runs": 6,
-  "expected_measured_runs": 20,
-  "updated_utc": "2026-09-19T02:19:09Z",
-  "error": "RuntimeError(\"Run validation failed: {'all_requests_completed': True, 'within_cache_budget': True, 'baseline_evicted': None, 'no_retractions': True, 'staging_within_reserve': True, 'expected_compressed_pool': True, 'cold_cache': True, 'cold_pass_misses': True, 'no_compression_failures': False}\")"
-}

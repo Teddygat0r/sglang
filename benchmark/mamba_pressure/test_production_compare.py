@@ -1,15 +1,20 @@
 import asyncio
 import json
-from pathlib import Path
 import tempfile
-from types import SimpleNamespace
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
+
 import production_compare as sweep
 import spark_run
+from test_benchmark_utils import use_synthetic_geometry
 
 
 class ProductionCompareTests(unittest.TestCase):
+    def setUp(self):
+        use_synthetic_geometry(self)
+
     def test_schedule_and_paired_report(self):
         calls = []
 
