@@ -4,6 +4,11 @@ from math import prod
 
 
 def validate_explicit_allocation(args):
+    # Compression commits change cache capacity and may evict prefix nodes.
+    # Until completions are coordinated across ranks, each worker must own
+    # the entire model so asynchronous completion cannot diverge TP batches.
+    if getattr(args, "mamba_svd_compression", False) and getattr(args, "tp_size", 1) != 1:
+        raise ValueError("Mamba SVD compression currently requires --tp-size 1")
     slots = getattr(args, "mamba_svd_cache_size", None)
     reserve = getattr(args, "mamba_svd_staging_reserve_bytes", 0)
     if reserve < 0:
