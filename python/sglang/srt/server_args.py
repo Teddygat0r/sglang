@@ -5060,8 +5060,9 @@ class ServerArgs:
             "--mamba-svd-staging-reserve-bytes",
             type=int,
             default=ServerArgs.mamba_svd_staging_reserve_bytes,
-            help="Bytes reserved during memory profiling for asynchronous compression "
-            "staging. Requires explicit compressed sizing. Not a runtime queue cap.",
+            help="Minimum bytes reserved for compression staging and workspace. "
+            "Requires explicit compressed sizing. The profiler always reserves "
+            "at least the bounded snapshot and pending-result storage.",
         )
         parser.add_argument(
             "--mamba-svd-compression",

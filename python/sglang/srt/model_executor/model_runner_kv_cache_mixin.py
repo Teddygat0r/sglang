@@ -179,22 +179,35 @@ class ModelRunnerKVCacheMixin:
         server_args = self.server_args
         assert config is not None
 
-        # Opt-in allocation: account for dense storage (including its sentinel),
-        # compressed storage and declared staging before sizing the KV pool.
-        # The staging reserve is not a runtime bound on asynchronous queues.
-        if getattr(server_args, "mamba_svd_cache_size", None) is not None:
+        compression = getattr(server_args, "mamba_svd_compression", False)
+        if compression:
             from sglang.srt.mem_cache.mamba_allocation import (
+                compression_staging_bytes,
                 explicit_mamba_bytes,
+                fit_mamba_cache_size,
                 validate_explicit_allocation,
             )
 
             validate_explicit_allocation(server_args)
+            params = config.mamba2_cache_params
+            max_pending = getattr(server_args, "mamba_svd_max_pending", 8)
+            worker_batch = getattr(server_args, "mamba_svd_worker_batch", 2)
+            staging_bytes = max(
+                getattr(server_args, "mamba_svd_staging_reserve_bytes", 0),
+                compression_staging_bytes(
+                    params, server_args.mamba_svd_rank, max_pending, worker_batch
+                ),
+            )
+
+        if getattr(server_args, "mamba_svd_cache_size", None) is not None:
             reserved = explicit_mamba_bytes(
-                config.mamba2_cache_params,
+                params,
                 server_args.max_mamba_cache_size,
                 server_args.mamba_svd_cache_size,
                 server_args.mamba_svd_rank,
-                server_args.mamba_svd_staging_reserve_bytes,
+                staging_bytes,
+                max_pending=max_pending,
+                worker_batch=worker_batch,
             )
             if reserved >= int(total_rest_memory * (1 << 30)):
                 raise ValueError("Explicit Mamba allocation leaves no memory for KV cache")
@@ -203,7 +216,7 @@ class ModelRunnerKVCacheMixin:
                 "reserved_bytes=%d (including dense sentinel)",
                 server_args.max_mamba_cache_size,
                 server_args.mamba_svd_cache_size,
-                server_args.mamba_svd_staging_reserve_bytes,
+                staging_bytes,
                 reserved,
             )
             return total_rest_memory - reserved / (1 << 30)
@@ -238,6 +251,17 @@ class ModelRunnerKVCacheMixin:
             server_args.max_mamba_cache_size = server_args.max_running_requests // (
                 server_args.dp_size if server_args.enable_dp_attention else 1
             )
+        elif compression:
+            # Preserve the requested Mamba/KV ratio after reserving staging.
+            # Both dense and compressed pools share the Mamba portion.
+            pool_budget = (
+                (int(total_rest_memory * (1 << 30)) - staging_bytes)
+                * server_args.mamba_full_memory_ratio
+                / (1 + server_args.mamba_full_memory_ratio)
+            )
+            server_args.max_mamba_cache_size = fit_mamba_cache_size(
+                params, pool_budget, server_args.mamba_svd_rank
+            )
         else:
             # Use ratio-based calculation to auto-fit available memory
             assert config.mamba2_cache_params.mamba_cache_per_req > 0
@@ -256,6 +280,24 @@ class ModelRunnerKVCacheMixin:
                 (mamba_state_memory_raw * (1 << 30))
                 // config.mamba2_cache_params.mamba_cache_per_req
             )
+
+        if compression:
+            full_slots = server_args.max_mamba_cache_size
+            if full_slots < 1:
+                raise ValueError("Memory budget cannot fit Mamba compression pools")
+            compressed_slots = max(1, full_slots // 2)
+            reserved = explicit_mamba_bytes(
+                params, full_slots, compressed_slots, server_args.mamba_svd_rank,
+                staging_bytes, max_pending=max_pending, worker_batch=worker_batch,
+            )
+            if reserved >= int(total_rest_memory * (1 << 30)):
+                raise ValueError("Mamba compression leaves no memory for KV cache")
+            logger.info(
+                "Mamba compression allocation: full=%d compressed=%d staging=%d "
+                "reserved_bytes=%d (including dense sentinel)",
+                full_slots, compressed_slots, staging_bytes, reserved,
+            )
+            return total_rest_memory - reserved / (1 << 30)
 
         mamba_state_memory = (
             server_args.max_mamba_cache_size

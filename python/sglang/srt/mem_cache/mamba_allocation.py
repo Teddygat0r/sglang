@@ -1,4 +1,4 @@
-"""Opt-in static Mamba pool accounting; not runtime queue-budget enforcement."""
+"""Memory accounting for dense, compressed, and staged Mamba cache states."""
 
 from math import prod
 
@@ -42,11 +42,50 @@ def compressed_state_bytes(params, rank):
     return int(len(params.layers) * (conv + heads * packed * params.dtype.temporal.itemsize))
 
 
-def explicit_mamba_bytes(params, full_slots, compressed_slots, rank, staging_bytes):
+def compression_staging_bytes(params, rank, max_pending=8, worker_batch=2):
+    """Storage retained by bounded jobs, excluding temporary SVD workspace.
+
+    Completed tensors are views into an entire worker batch. Conservatively
+    charge that full batch for each retained result until its final view dies.
+    Additional linalg workspace uses the dynamic memory budget or an explicit
+    staging reserve larger than this minimum.
+    """
+    compressed_state_bytes(params, rank)  # Validate the geometry and rank.
+    if max_pending < 1 or worker_batch < 1:
+        raise ValueError("Compression staging and worker batch must be positive")
+    heads, dim, state = params.shape.temporal
+    matrices = len(params.layers) * heads
+    snapshot = matrices * dim * state * params.dtype.temporal.itemsize
+    packed = matrices * rank * (dim + 1 + state) * 4  # SVD returns float32.
+    return max_pending * (snapshot + min(worker_batch, max_pending) * packed)
+
+
+def fit_mamba_cache_size(params, pool_budget_bytes, rank):
+    """Largest dense pool whose sentinel and default compressed pool fit."""
+    dense = params.mamba_cache_per_req
+    compressed = compressed_state_bytes(params, rank)
+    low, high = 0, max(0, int(pool_budget_bytes) // dense)
+    while low < high:
+        mid = (low + high + 1) // 2
+        required = (mid + 1) * dense + max(1, mid // 2) * compressed
+        if required <= pool_budget_bytes:
+            low = mid
+        else:
+            high = mid - 1
+    return low
+
+
+def explicit_mamba_bytes(
+    params, full_slots, compressed_slots, rank, staging_bytes,
+    *, max_pending=8, worker_batch=2,
+):
     if full_slots <= 0 or compressed_slots <= 0 or staging_bytes < 0:
         raise ValueError("Invalid explicit Mamba pool allocation")
     return int(
         (full_slots + 1) * params.mamba_cache_per_req
         + compressed_slots * compressed_state_bytes(params, rank)
-        + staging_bytes
+        + max(
+            staging_bytes,
+            compression_staging_bytes(params, rank, max_pending, worker_batch),
+        )
     )
