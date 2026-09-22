@@ -9,6 +9,8 @@ def validate_explicit_allocation(args):
     # the entire model so asynchronous completion cannot diverge TP batches.
     if getattr(args, "mamba_svd_compression", False) and getattr(args, "tp_size", 1) != 1:
         raise ValueError("Mamba SVD compression currently requires --tp-size 1")
+    if getattr(args, "mamba_svd_max_pending", 8) < 1:
+        raise ValueError("mamba_svd_max_pending must be positive")
     slots = getattr(args, "mamba_svd_cache_size", None)
     reserve = getattr(args, "mamba_svd_staging_reserve_bytes", 0)
     if reserve < 0:

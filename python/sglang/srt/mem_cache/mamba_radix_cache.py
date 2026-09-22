@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.compression_staging import CompressionStaging
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
@@ -72,6 +73,7 @@ class CompressionJob:
     """Unique state-version token; workers see no mutable radix-tree metadata."""
 
     node_id: int
+    ready: Optional[torch.cuda.Event] = None
     cancelled: threading.Event = field(default_factory=threading.Event)
 
 
@@ -1079,6 +1081,12 @@ class MambaRadixCache(BasePrefixCache):
         self._compressed_lru: "OrderedDict[int, TreeNode]" = OrderedDict()
         self._pending_compression: Dict[int, TreeNode] = {}
         self._compression_jobs: Dict[int, CompressionJob] = {}
+        self._compression_staging = CompressionStaging(
+            getattr(get_global_server_args(), "mamba_svd_max_pending", 8),
+            (L, H, D, S),
+            temporal_dtype,
+            self.device,
+        )
         self._compression_queue: queue.Queue = queue.Queue()
         self._compression_done_queue: queue.Queue = queue.Queue()
         self._compression_failed_queue: queue.Queue = queue.Queue()
@@ -1167,13 +1175,15 @@ class MambaRadixCache(BasePrefixCache):
         self._drain_queue(self._compression_done_queue)
         self._drain_queue(self._compression_failed_queue)
 
-    @staticmethod
-    def _drain_queue(q: queue.Queue) -> None:
+    def _drain_queue(self, q: queue.Queue) -> None:
         while True:
             try:
-                q.get_nowait()
+                item = q.get_nowait()
             except queue.Empty:
                 return
+            if item is not None:
+                job = item[0] if isinstance(item, tuple) else item
+                self._compression_staging.release(job)
 
     def _is_live_compression_node(self, node: TreeNode) -> bool:
         cur = node
@@ -1185,14 +1195,12 @@ class MambaRadixCache(BasePrefixCache):
         return cur is self.root_node
 
     def _enqueue_compression(self, node: TreeNode) -> None:
-        """Snapshot the node's full-rank state and post to the SVD worker.
+        """Copy into bounded staging on the scheduler stream without host waits.
 
-        The snapshot clone is issued on the *SVD stream*, not the default
-        (inference) stream. It can still contend with decode for GPU bandwidth.
-        An event recorded on the current stream makes the SVD stream wait for
-        the prefill write that produced this slot before it reads. The host
-        cost of this method is just an event record plus a kernel launch on the
-        side stream, so the scheduler thread is not stalled by the copy."""
+        Admission happens before the copy. Exhausted staging simply leaves the
+        node in the full cache. An event orders the worker's read after the copy;
+        snapshot storage stays reserved through completion, cancellation or reset.
+        """
         if not self.enable_svd_compression:
             return
         if node.mamba_value is None or node.mamba_compressed:
@@ -1202,30 +1210,31 @@ class MambaRadixCache(BasePrefixCache):
         if node.id in self._pending_compression:
             return
 
+        ready = torch.cuda.Event() if self._svd_stream is not None else None
+        job = CompressionJob(node.id, ready=ready)
+        snapshot = self._compression_staging.acquire(job)
+        if snapshot is None:
+            return
         pool = self.req_to_token_pool.mamba_pool
-        # pool.mamba_cache.temporal shape is [L, N, H, D, S]; mamba_value is a [1] slot tensor
         try:
-            src = pool.mamba_cache.temporal[:, node.mamba_value].squeeze(1).detach()
-            if self._svd_stream is not None:
-                event = torch.cuda.Event()
-                event.record()  # default stream: orders after the prefill write
-                with torch.cuda.stream(self._svd_stream):
-                    self._svd_stream.wait_event(event)
-                    gpu_snapshot = src.clone()  # clone runs on the SVD stream
-                    # The event orders reads after writes, but does not protect
-                    # this temporary's allocation from reuse on its creator stream.
-                    # Keep its storage live until the asynchronous clone finishes.
-                    src.record_stream(self._svd_stream)
-            else:
-                gpu_snapshot = src.clone()
+            # Gather directly into fixed storage. Ordering on the scheduler
+            # stream protects against subsequent full-pool slot reuse.
+            torch.index_select(
+                pool.mamba_cache.temporal,
+                1,
+                node.mamba_value,
+                out=snapshot.unsqueeze(1),
+            )
+            if ready is not None:
+                ready.record()
         except Exception as e:
+            self._compression_staging.release(job)
             logger.warning("Failed to snapshot mamba state for node %s: %s", node.id, e)
             return
 
-        job = CompressionJob(node.id)
         self._pending_compression[node.id] = node
         self._compression_jobs[node.id] = job
-        self._compression_queue.put((job, gpu_snapshot))
+        self._compression_queue.put((job, snapshot))
 
     def _invalidate_compression(self, node_id: int) -> None:
         """Scheduler-only cancellation; does not wait for GPU work or pin a slot."""
@@ -1236,6 +1245,7 @@ class MambaRadixCache(BasePrefixCache):
 
     def _take_compression_result(self, job: CompressionJob) -> Optional[TreeNode]:
         """Accept a result only for the exact currently pending state version."""
+        self._compression_staging.release(job)
         if job.cancelled.is_set() or self._compression_jobs.get(job.node_id) is not job:
             return None
         node = self._pending_compression.get(job.node_id)
@@ -1275,7 +1285,7 @@ class MambaRadixCache(BasePrefixCache):
                     batch.append(nxt)
             # A queued snapshot can outlive its radix node. Filter stale work
             # before launching SVD so evicted nodes do not consume GPU time.
-            batch = [item for item in batch if self._is_live_compression_item(item)]
+            batch = self._discard_cancelled_compression(batch)
             if not batch:
                 continue
             admission = getattr(self, "compression_admission", None)
@@ -1283,9 +1293,11 @@ class MambaRadixCache(BasePrefixCache):
                 stop_event,
                 cancelled=lambda: all(item[0].cancelled.is_set() for item in batch),
             ):
+                for job, _ in batch:
+                    self._compression_staging.release(job)
                 continue
             # Eviction/reset can cancel work while admission is deferred.
-            batch = [item for item in batch if self._is_live_compression_item(item)]
+            batch = self._discard_cancelled_compression(batch)
             if not batch:
                 continue
             try:
@@ -1296,6 +1308,15 @@ class MambaRadixCache(BasePrefixCache):
                 # Scheduler owns pending-state cleanup; preserve the full states.
                 for job, _ in batch:
                     self._compression_failed_queue.put(job)
+
+    def _discard_cancelled_compression(self, batch):
+        live = []
+        for item in batch:
+            if self._is_live_compression_item(item):
+                live.append(item)
+            else:
+                self._compression_staging.release(item[0])
+        return live
 
     def _is_live_compression_item(self, item: Tuple[CompressionJob, torch.Tensor]) -> bool:
         """Worker cancellation check; never read or mutate tree/pending metadata."""
@@ -1324,9 +1345,15 @@ class MambaRadixCache(BasePrefixCache):
             return packed
 
         if self._svd_stream is not None:
-            with torch.cuda.stream(self._svd_stream):
-                packed = _run()
-            self._svd_stream.synchronize()
+            try:
+                with torch.cuda.stream(self._svd_stream):
+                    for job, _ in batch:
+                        if job.ready is not None:
+                            self._svd_stream.wait_event(job.ready)
+                    packed = _run()
+            finally:
+                # Also protect staging if an exception follows partial submission.
+                self._svd_stream.synchronize()
         else:
             packed = _run()
 

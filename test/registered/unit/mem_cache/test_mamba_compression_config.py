@@ -19,6 +19,16 @@ class TestMambaCompressionConfig(unittest.TestCase):
                         mamba_svd_cache_size=slots,
                     )
 
+    def test_staging_capacity_must_be_positive(self):
+        for capacity in (0, -1):
+            with self.subTest(capacity=capacity):
+                with self.assertRaisesRegex(ValueError, "max_pending must be positive"):
+                    ServerArgs(
+                        model_path="dummy",
+                        mamba_svd_compression=True,
+                        mamba_svd_max_pending=capacity,
+                    )
+
     def test_single_rank_compression_is_accepted(self):
         args = ServerArgs(model_path="dummy", mamba_svd_compression=True)
         self.assertEqual(args.tp_size, 1)

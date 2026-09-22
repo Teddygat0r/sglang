@@ -550,6 +550,7 @@ class ServerArgs:
     mamba_svd_niter: int = 1
     mamba_svd_oversample: int = 4
     mamba_svd_worker_batch: int = 2
+    mamba_svd_max_pending: int = 8
     disable_mamba_svd_prefill_deferral: bool = False
     mamba_svd_cache_size: Optional[int] = None
     mamba_svd_staging_reserve_bytes: int = 0
@@ -5094,6 +5095,13 @@ class ServerArgs:
             default=ServerArgs.mamba_svd_worker_batch,
             help="Max pending mamba-state snapshots folded into one batched SVD "
             "call by the async worker. Larger amortizes kernel-launch overhead.",
+        )
+        parser.add_argument(
+            "--mamba-svd-max-pending",
+            type=int,
+            default=ServerArgs.mamba_svd_max_pending,
+            help="Maximum compression jobs across queued snapshots, in-flight SVD, "
+            "and uncommitted results. When full, keep new states uncompressed.",
         )
         parser.add_argument(
             "--disable-mamba-svd-prefill-deferral",

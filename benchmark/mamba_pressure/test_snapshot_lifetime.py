@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import torch
 from sglang.srt.mem_cache.mamba_radix_cache import CompressionJob, MambaRadixCache
+from sglang.srt.mem_cache.compression_staging import CompressionStaging
 
 
 def make_tree(device='cpu', shape=(2, 2, 2, 8, 8)):
@@ -29,6 +30,7 @@ def make_tree(device='cpu', shape=(2, 2, 2, 8, 8)):
     tree._svd_stream = torch.cuda.Stream() if device == 'cuda' else None
     tree.svd_worker_batch = 8
     tree.svd_rank = 2
+    tree._compression_staging = CompressionStaging(8, (shape[0], *shape[2:]), torch.float32, device)
     tree.req_to_token_pool = NS(mamba_pool=NS(mamba_cache=NS(
         temporal=torch.ones(shape, device=device))))
     return tree
