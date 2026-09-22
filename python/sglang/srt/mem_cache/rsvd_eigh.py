@@ -205,7 +205,7 @@ def randomized_svd_eigh(
     d = torch.diagonal(C, dim1=-2, dim2=-1).mean(dim=-1, keepdim=True).clamp_min(1e-30)
     eye_q = torch.eye(C.shape[-1], device=C.device, dtype=C.dtype)
     C = C + (1e-8 * d).unsqueeze(-1) * eye_q
-    
+
     #try fp32 first, on failure try fp64
     try:
         evals, evecs = torch.linalg.eigh(C)           # ascending eigvals

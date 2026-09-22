@@ -18,6 +18,9 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToToke
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-small")
 
 
 def _create_pool_resources(device):
@@ -51,7 +54,7 @@ def _create_pool_resources(device):
         cache_params=mamba2_cache_params,
         mamba_layer_ids=mamba_layers,
         enable_mamba_extra_buffer=False,
-        speculative_num_draft_tokens=3,
+        speculative_num_draft_tokens=None,
     )
     pool = HybridLinearKVPool(
         size=128,
@@ -131,11 +134,11 @@ class TestMambaSVDCompression(unittest.TestCase):
         cls.req_to_token_pool, cls.allocator = _create_pool_resources(cls.device)
 
     def setUp(self):
-        """Reset tracked requests between tests to avoid pool exhaustion."""
-        if hasattr(self, "_tracked_reqs"):
-            for req in self._tracked_reqs:
-                self.req_to_token_pool.free_mamba_cache(req)
-                self.req_to_token_pool.free(req)
+        # Tests transfer ownership of request slots into the tree. Clear the
+        # shared allocators after the previous test's worker has been joined,
+        # rather than freeing request slots that compression may already own.
+        self.req_to_token_pool.clear()
+        self.allocator.clear()
         self._tracked_reqs = []
 
     def _fresh_tree(self, svd_compression=True, svd_rank=4):
@@ -145,7 +148,13 @@ class TestMambaSVDCompression(unittest.TestCase):
             svd_compression=svd_compression,
             svd_rank=svd_rank,
         )
+        self.addCleanup(self._cleanup_tree, tree)
         return tree
+
+    def _cleanup_tree(self, tree):
+        if tree._compression_thread is not None:
+            self._stop_compression_worker(tree)
+            tree._reset_compression_state()
 
     def _drain_sync(self, tree, timeout_s: float = 5.0):
         """Wait for the async SVD worker to drain its work queue, then commit completions
@@ -154,17 +163,15 @@ class TestMambaSVDCompression(unittest.TestCase):
             return
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
+            tree.drain_compression_completions()
             if (
                 tree._compression_queue.empty()
                 and not tree._pending_compression
                 and tree._compression_done_queue.empty()
             ):
                 return
-            if not tree._compression_done_queue.empty():
-                tree.drain_compression_completions()
-            else:
-                time.sleep(0.01)
-        tree.drain_compression_completions()
+            time.sleep(0.01)
+        self.fail("Compression worker did not finish within the test timeout")
 
     def _req(self):
         req = _make_req(self.req_to_token_pool)
@@ -173,8 +180,10 @@ class TestMambaSVDCompression(unittest.TestCase):
 
     def _stop_compression_worker(self, tree):
         tree._compression_stop_event.set()
+        tree._compression_queue.put(None)
         tree._compression_thread.join(timeout=2.0)
         self.assertFalse(tree._compression_thread.is_alive())
+        tree._drain_queue(tree._compression_queue)
 
     def test_compression_queue_retains_more_than_worker_batch(self):
         tree = self._fresh_tree(svd_compression=True)
@@ -193,7 +202,7 @@ class TestMambaSVDCompression(unittest.TestCase):
         self.assertEqual(tree._compression_queue.qsize(), tree.svd_worker_batch + 1)
         self.assertEqual(len(tree._pending_compression), tree.svd_worker_batch + 1)
 
-    def test_compression_worker_rejects_detached_node(self):
+    def test_scheduler_rejects_detached_node_completion(self):
         tree = self._fresh_tree(svd_compression=True)
         self._stop_compression_worker(tree)
 
@@ -208,8 +217,14 @@ class TestMambaSVDCompression(unittest.TestCase):
         item = tree._compression_queue.get_nowait()
         node = tree.root_node.children.pop(200)
 
-        self.assertFalse(tree._is_live_compression_item(item))
+        # The worker only checks cancellation; the scheduler validates tree
+        # membership before accepting a result from a detached node.
+        self.assertTrue(tree._is_live_compression_item(item))
+        tree._compression_done_queue.put((item[0], tree.compressed_temporal[0].clone()))
+        tree.drain_compression_completions()
+        self.assertFalse(node.mamba_compressed)
         self.assertNotIn(node.id, tree._pending_compression)
+        self.assertEqual(tree._compression_staging.available_size(), 8)
 
     def test_late_compression_completion_after_reset_is_dropped(self):
         tree = self._fresh_tree(svd_compression=True)
@@ -226,11 +241,12 @@ class TestMambaSVDCompression(unittest.TestCase):
         node = tree.root_node.children[205]
         self.assertIn(node.id, tree._pending_compression)
 
+        job, _ = tree._compression_queue.get_nowait()
         packed = tree.compressed_temporal[0].clone()
         tree.reset()
 
         # Simulate an in-flight worker publishing a completion after flush/reset.
-        tree._compression_done_queue.put((node.id, packed))
+        tree._compression_done_queue.put((job, packed))
         tree.drain_compression_completions()
 
         self.assertEqual(tree.mamba_evictable_size_, 0)
@@ -423,7 +439,8 @@ class TestMambaSVDCompression(unittest.TestCase):
         self._drain_sync(tree)
         node = tree.root_node.children[1]
         self.assertTrue(
-            node.mamba_compressed, "Node must be compressed for this test to exercise SVD"
+            node.mamba_compressed,
+            "Node must be compressed for this test to exercise SVD",
         )
 
         req2 = self._req()
@@ -632,9 +649,9 @@ class TestMambaSVDCompression(unittest.TestCase):
         # temporal[:, slot_tensor] is [L, 1, H, D, S]; squeeze the slot dim so the
         # subtraction against [L, H, D, S] original doesn't trigger a bad broadcast.
         reconstructed = mamba_pool.mamba_cache.temporal[:, dst_scratch].squeeze(1)
-        relative_error = torch.norm(
-            original_state.float() - reconstructed.float()
-        ) / (torch.norm(original_state.float()) + 1e-8)
+        relative_error = torch.norm(original_state.float() - reconstructed.float()) / (
+            torch.norm(original_state.float()) + 1e-8
+        )
         self.assertLess(
             relative_error.item(),
             0.1,
@@ -657,7 +674,9 @@ class TestMambaSVDCompression(unittest.TestCase):
         node_full.mamba_compressed = False
         tree._free_mamba_state(node_full)
 
-        self.assertIsNone(node_full.mamba_value, "full-rank branch should clear mamba_value")
+        self.assertIsNone(
+            node_full.mamba_value, "full-rank branch should clear mamba_value"
+        )
         self.assertFalse(node_full.mamba_compressed)
         self.assertEqual(
             mamba_pool.available_size(),

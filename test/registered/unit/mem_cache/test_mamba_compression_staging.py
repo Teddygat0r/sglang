@@ -32,7 +32,11 @@ def make_tree(device="cpu", capacity=3):
     tree.svd_oversample = 4
     tree.compressed_temporal = torch.empty(1)
     temporal = torch.randn(
-        2, 2, 2, 8, 8,
+        2,
+        2,
+        2,
+        8,
+        8,
         generator=torch.Generator(device=device).manual_seed(7),
         device=device,
     )

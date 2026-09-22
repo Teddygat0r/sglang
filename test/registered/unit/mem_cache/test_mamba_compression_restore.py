@@ -34,12 +34,16 @@ class TestMambaCompressionRestore(unittest.TestCase):
                 expected = expected.expand(2, 2, 4, 4)
                 if compressed:
                     tree.compressed_temporal = torch.cat(
-                        [torch.ones(1, 2, 2, 4, device="cuda"),
-                         torch.full((1, 2, 2, 1), 3., device="cuda"),
-                         torch.arange(4, device="cuda").expand(1, 2, 2, 4)],
+                        [
+                            torch.ones(1, 2, 2, 4, device="cuda"),
+                            torch.full((1, 2, 2, 1), 3.0, device="cuda"),
+                            torch.arange(4, device="cuda").expand(1, 2, 2, 4),
+                        ],
                         dim=-1,
                     )
-                    tree.compressed_conv = [torch.full((1, 2, 4, 3), 7., device="cuda")]
+                    tree.compressed_conv = [
+                        torch.full((1, 2, 4, 3), 7.0, device="cuda")
+                    ]
                 else:
                     pool.mamba_cache.temporal[:, 1] = expected
                     pool.mamba_cache.conv[0][:, 1] = 7

@@ -7,7 +7,10 @@ def validate_explicit_allocation(args):
     # Compression commits change cache capacity and may evict prefix nodes.
     # Until completions are coordinated across ranks, each worker must own
     # the entire model so asynchronous completion cannot diverge TP batches.
-    if getattr(args, "mamba_svd_compression", False) and getattr(args, "tp_size", 1) != 1:
+    if (
+        getattr(args, "mamba_svd_compression", False)
+        and getattr(args, "tp_size", 1) != 1
+    ):
         raise ValueError("Mamba SVD compression currently requires --tp-size 1")
     if getattr(args, "mamba_svd_max_pending", 8) < 1:
         raise ValueError("mamba_svd_max_pending must be positive")
@@ -28,7 +31,9 @@ def validate_explicit_allocation(args):
     if getattr(args, "dp_size", 1) != 1 or getattr(args, "pp_size", 1) != 1:
         raise ValueError("Explicit Mamba sizing currently supports DP=1 and PP=1 only")
     if getattr(args, "speculative_algorithm", None) is not None:
-        raise ValueError("Explicit Mamba sizing does not yet support speculative decoding")
+        raise ValueError(
+            "Explicit Mamba sizing does not yet support speculative decoding"
+        )
     if getattr(args, "disable_radix_cache", False):
         raise ValueError("Explicit compressed sizing requires radix caching")
 
@@ -39,7 +44,9 @@ def compressed_state_bytes(params, rank):
     if rank <= 0 or packed > dim * state:
         raise ValueError("SVD rank must be positive and fit within the dense state")
     conv = sum(prod(shape) for shape in params.shape.conv) * params.dtype.conv.itemsize
-    return int(len(params.layers) * (conv + heads * packed * params.dtype.temporal.itemsize))
+    return int(
+        len(params.layers) * (conv + heads * packed * params.dtype.temporal.itemsize)
+    )
 
 
 def compression_staging_bytes(params, rank, max_pending=8, worker_batch=2):
@@ -76,8 +83,14 @@ def fit_mamba_cache_size(params, pool_budget_bytes, rank):
 
 
 def explicit_mamba_bytes(
-    params, full_slots, compressed_slots, rank, staging_bytes,
-    *, max_pending=8, worker_batch=2,
+    params,
+    full_slots,
+    compressed_slots,
+    rank,
+    staging_bytes,
+    *,
+    max_pending=8,
+    worker_batch=2,
 ):
     if full_slots <= 0 or compressed_slots <= 0 or staging_bytes < 0:
         raise ValueError("Invalid explicit Mamba pool allocation")
