@@ -1,0 +1,64 @@
+"""Archived matched strict-prefill-exclusion experiment."""
+import hashlib
+import json
+from argparse import Namespace
+from pathlib import Path
+import subprocess
+
+from allocation_native import configs, estimate
+from spark_run import one_run, save, trace, ROOT
+from tail_sweep import main
+
+
+def summarize(root):
+    groups = {}
+    for path in (root / 'full').glob('*/result.json'):
+        row = json.loads(path.read_text())
+        if any(v is False for v in row['validation'].values()):
+            continue
+        groups.setdefault(row['config']['label'], {})[row['repetition']] = row['metrics']
+    summary = {label: {key: estimate([m[key] for m in runs.values()]) for key in next(iter(runs.values()))}
+               for label, runs in groups.items()}
+    paired = {}
+    for label in ('sync_control', 'strict'):
+        reps = sorted(set(groups.get(label, {})) & set(groups.get('baseline', {})))
+        if reps:
+            keys = set(groups[label][reps[0]]) & set(groups['baseline'][reps[0]])
+            paired[label] = {key: estimate([groups[label][r][key] - groups['baseline'][r][key] for r in reps]) for key in keys}
+    save(root / 'summary.json', dict(groups=summary, paired_vs_baseline=paired))
+    lines = ['# Prefill-aware compression experiment', '',
+             'Strict exclusion versus unchanged eager baseline and synchronization-only control. See PREFILL_GATE.md.', '']
+    for label, metrics in summary.items():
+        lines += [f'## {label} (n={len(groups[label])})', '', '| Metric | Mean | 95% CI |', '|---|---:|---|']
+        lines += [f"| {key} | {v['mean']:.6g} | {v['ci95']} |" for key, v in metrics.items()]
+        lines.append('')
+    (root / 'report.md').write_text('\n'.join(lines))
+
+
+async def experiment(root):
+    base = next(c for c in configs() if c['full_slots'] == 32)
+    design = [{**base, 'label': 'baseline'},
+              {**base, 'label': 'sync_control', 'prefill_gate': 'sync_control'},
+              {**base, 'label': 'strict', 'prefill_gate': 'strict'}]
+    save(root / 'protocol.json', dict(configs=design, repetitions=5, measured_runs=15, pilots=3,
+         seed=20261101, checkpoint=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
+         hashes={p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in Path(__file__).parent.glob('*.py')},
+         ordering='Reverse mode order on odd repetitions; identical trace within repetition'))
+    completed = 0
+    for phase in ('pilot', 'full'):
+        for rep in range(1 if phase == 'pilot' else 5):
+            for config in reversed(design) if phase == 'pilot' or rep % 2 else design:
+                target = root / phase / f"{config['label']}_r{rep}"
+                save(root / 'status.json', dict(state='running', run=str(target), completed=completed, total=18))
+                args = Namespace(groups=8 if phase == 'pilot' else 64, rounds=2 if phase == 'pilot' else 3,
+                                 prefix=2048, output=128, seed=20261100 if phase == 'pilot' else 20261101,
+                                 port=31037, concurrency=4, pilot=phase == 'pilot')
+                await one_run(args, config, rep, target, trace(args, rep))
+                completed += 1
+                if phase == 'full':
+                    summarize(root)
+    save(root / 'status.json', dict(state='complete', completed=completed, report=str(root / 'report.md')))
+
+
+if __name__ == '__main__':
+    main(experiment, __file__)

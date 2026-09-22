@@ -1,0 +1,4 @@
+{
+  "winner": "reuse",
+  "criterion": "mean request throughput; hit rate tie-break"
+}

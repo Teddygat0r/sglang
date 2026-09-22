@@ -1,0 +1,65 @@
+{
+  "geometry": {
+    "staging_live_bytes": 0,
+    "staging_peak_bytes": 0,
+    "kv_pool_bytes": 8589967360,
+    "mamba_pool_bytes": 1287782400,
+    "full_state_bytes": 51511296,
+    "temporal_shape": [
+      24,
+      25,
+      32,
+      128,
+      128
+    ],
+    "temporal_element_bytes": 4,
+    "compressed_pool_bytes": 0,
+    "full_state_slots": 24,
+    "compressed_slots": 0,
+    "full_free_slots": 21,
+    "compressed_entries": 0,
+    "compression_pending": 0,
+    "compression_queue_depth": 0,
+    "cuda_allocated_bytes": 19482481152,
+    "cuda_peak_allocated_bytes": 19554098688,
+    "persistent_cache_bytes": 9877749760,
+    "peak_cache_state_bytes": 9877749760
+  },
+  "configs": [
+    {
+      "baseline_slots": 24,
+      "compression": false,
+      "full_slots": 24,
+      "kv_tokens": 262144,
+      "budget_bytes": 9877749760,
+      "staging_reserve_bytes": 0
+    },
+    {
+      "baseline_slots": 24,
+      "compression": true,
+      "full_slots": 18,
+      "kv_tokens": 263066,
+      "budget_bytes": 9877749760,
+      "staging_reserve_bytes": 154533888
+    },
+    {
+      "baseline_slots": 192,
+      "compression": false,
+      "full_slots": 192,
+      "kv_tokens": 262144,
+      "budget_bytes": 18531647488,
+      "staging_reserve_bytes": 0
+    },
+    {
+      "baseline_slots": 192,
+      "compression": true,
+      "full_slots": 166,
+      "kv_tokens": 263315,
+      "budget_bytes": 18531647488,
+      "staging_reserve_bytes": 154533888
+    }
+  ],
+  "full_state_bytes": 51511296,
+  "compressed_state_bytes": 13811712,
+  "kv_bytes_per_token": 32768
+}

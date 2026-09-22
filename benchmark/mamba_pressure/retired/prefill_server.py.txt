@@ -1,0 +1,19 @@
+"""Archived prefill/SVD exclusion entry point, no longer runnable."""
+import os
+import sys
+import server
+from prefill_gate import install
+
+install(os.environ['PRESSURE_PREFILL_GATE'])
+
+if __name__ == '__main__':
+    from sglang.launch_server import run_server
+    from sglang.srt.server_args import prepare_server_args
+    from sglang.srt.utils import kill_process_tree
+    try:
+        args = prepare_server_args(sys.argv[1:])
+        if not args.disable_overlap_schedule or not args.disable_cuda_graph:
+            raise ValueError('Prefill gate test requires overlap and CUDA graphs disabled')
+        run_server(args)
+    finally:
+        kill_process_tree(os.getpid(), include_parent=False)

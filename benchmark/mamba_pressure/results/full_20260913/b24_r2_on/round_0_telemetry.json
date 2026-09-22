@@ -1,0 +1,33 @@
+{
+  "staging_live_bytes": 100663296,
+  "staging_peak_bytes": 163627008,
+  "compression_enqueued": 192,
+  "compression_pending_peak": 2,
+  "compression_completed": 191,
+  "compression_committed": 191,
+  "evicted_entries": 182,
+  "evicted_compressed_entries": 182,
+  "evicted_kv_tokens": 124260,
+  "kv_pool_bytes": 8620179456,
+  "mamba_pool_bytes": 978714624,
+  "full_state_bytes": 51511296,
+  "temporal_shape": [
+    24,
+    19,
+    32,
+    128,
+    128
+  ],
+  "temporal_element_bytes": 4,
+  "compressed_pool_bytes": 124305408,
+  "full_state_slots": 18,
+  "compressed_slots": 9,
+  "full_free_slots": 17,
+  "compressed_entries": 9,
+  "compression_pending": 1,
+  "compression_queue_depth": 0,
+  "cuda_allocated_bytes": 19550461440,
+  "cuda_peak_allocated_bytes": 20103711744,
+  "persistent_cache_bytes": 9723199488,
+  "peak_cache_state_bytes": 9886826496
+}

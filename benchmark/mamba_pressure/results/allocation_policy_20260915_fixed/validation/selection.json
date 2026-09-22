@@ -1,0 +1,4 @@
+{
+  "winner": "b192_on",
+  "criterion": "mean request throughput; hit rate tie-break"
+}

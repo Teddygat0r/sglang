@@ -1,0 +1,6 @@
+{
+  "state": "complete",
+  "measured_runs": 20,
+  "pilot_runs": 4,
+  "report": "/home/joshuaz/sglang/benchmark/mamba_pressure/results/native_allocation_20260918/report.md"
+}

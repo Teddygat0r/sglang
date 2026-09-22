@@ -1,0 +1,81 @@
+{
+  "all": {
+    "n": 192,
+    "means": {
+      "ttft_ms": 508.1398988550063,
+      "cache_lookup_host_ms": 1.48239296875,
+      "cache_lookup_gpu_span_ms": 0,
+      "restore_host_ms": 1.1230500260416667,
+      "restore_gpu_span_ms": 1.3027181718498468,
+      "forward_host_ms": 32.403248895833336,
+      "forward_gpu_span_ms": 291.9625676671664,
+      "svd_host_overlap_ms": 86.96750473958333,
+      "commit_loop_host_overlap_ms": 0.20917296875,
+      "client_to_first_forward_ms": 234.19173768229166
+    }
+  },
+  "tail": {
+    "n": 11,
+    "means": {
+      "ttft_ms": 1598.7639601596377,
+      "cache_lookup_host_ms": 0.11031736363636364,
+      "cache_lookup_gpu_span_ms": 0,
+      "restore_host_ms": 0.0,
+      "restore_gpu_span_ms": 0,
+      "forward_host_ms": 52.37326590909091,
+      "forward_gpu_span_ms": 486.3880792097612,
+      "svd_host_overlap_ms": 484.95150072727273,
+      "commit_loop_host_overlap_ms": 1.2814821818181819,
+      "client_to_first_forward_ms": 1138.1538867272727
+    }
+  },
+  "non_tail": {
+    "n": 181,
+    "means": {
+      "ttft_ms": 441.85887855472487,
+      "cache_lookup_host_ms": 1.5657787790055249,
+      "cache_lookup_gpu_span_ms": 0,
+      "restore_host_ms": 1.191301685082873,
+      "restore_gpu_span_ms": 1.3818888894760806,
+      "forward_host_ms": 31.189601453038673,
+      "forward_gpu_span_ms": 280.14665260104186,
+      "svd_host_overlap_ms": 62.78063205524862,
+      "commit_loop_host_overlap_ms": 0.14400500552486187,
+      "client_to_first_forward_ms": 179.25481149723757
+    }
+  },
+  "compressed": {
+    "n": 126,
+    "means": {
+      "ttft_ms": 138.6684783187414,
+      "cache_lookup_host_ms": 2.2069022698412697,
+      "cache_lookup_gpu_span_ms": 0,
+      "restore_host_ms": 1.7113143253968255,
+      "restore_gpu_span_ms": 1.9850943571045285,
+      "forward_host_ms": 22.537090428571428,
+      "forward_gpu_span_ms": 100.42331235370939,
+      "svd_host_overlap_ms": 9.927207325396825,
+      "commit_loop_host_overlap_ms": 0.05732723015873016,
+      "client_to_first_forward_ms": 70.39492657936508
+    }
+  },
+  "full": {
+    "n": 0,
+    "means": {}
+  },
+  "miss": {
+    "n": 66,
+    "means": {
+      "ttft_ms": 1213.494428969694,
+      "cache_lookup_host_ms": 0.09923884848484849,
+      "cache_lookup_gpu_span_ms": 0,
+      "restore_host_ms": 0.0,
+      "restore_gpu_span_ms": 0,
+      "forward_host_ms": 51.23864233333333,
+      "forward_gpu_span_ms": 657.6284187201297,
+      "svd_host_overlap_ms": 234.04443616666666,
+      "commit_loop_host_overlap_ms": 0.49906028787878787,
+      "client_to_first_forward_ms": 546.8947406969697
+    }
+  }
+}

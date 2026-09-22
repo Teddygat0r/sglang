@@ -1,0 +1,4 @@
+{
+  "winner": "full16",
+  "criterion": "mean request throughput; hit rate tie-break"
+}

@@ -1,0 +1,61 @@
+{
+  "git_commit": "92a48d7294b4b585bacef7a23a2fb85577249a64",
+  "configs": [
+    {
+      "label": "fixed_f16",
+      "native_allocation": true,
+      "baseline_slots": 128,
+      "concurrency": 4,
+      "compression": true,
+      "full_slots": 16,
+      "compressed_slots": 358,
+      "compressed_state_bytes": 13811712,
+      "kv_tokens": 262144,
+      "kv_pool_bytes": 8589967360,
+      "budget_bytes": 15234924544,
+      "staging_reserve_bytes": 824180736,
+      "pre_optimization": false
+    },
+    {
+      "label": "fixed_f32",
+      "native_allocation": true,
+      "baseline_slots": 128,
+      "concurrency": 4,
+      "compression": true,
+      "full_slots": 32,
+      "compressed_slots": 298,
+      "compressed_state_bytes": 13811712,
+      "kv_tokens": 262144,
+      "kv_pool_bytes": 8589967360,
+      "budget_bytes": 15234924544,
+      "staging_reserve_bytes": 824180736,
+      "pre_optimization": false
+    }
+  ],
+  "repetitions": 5,
+  "measured_runs": 10,
+  "pilots": 2,
+  "groups": 64,
+  "rounds": 3,
+  "prefix": 2048,
+  "suffix": 16,
+  "output": 128,
+  "seed": 20261001,
+  "ordering": "Repetitions 1,0,2,3,4; same trace/seed within each repetition; alternate allocation order. Previously failing seed first.",
+  "policy": "lru",
+  "native_allocation": true,
+  "staging_full_states": 16,
+  "note": "Fresh post-race-fix validation. Performance optimizations remain reverted. Pilots excluded; abort on failed validation, no retries.",
+  "hashes": {
+    "benchmark/mamba_pressure/race_fixed.py": "4058c5400e9eef324971d2629e00c31acb376a8b3199b258ad628ac062068b95",
+    "benchmark/mamba_pressure/spark_run.py": "a6593e83b1b3729dab7e79ae2f902659948ff2870e3e02ba8ac7a0e212180d43",
+    "benchmark/mamba_pressure/server.py": "9fc76eb9a161a4e56cd0a908a6cda217ae6304faa2282510d53bb2e1016530dc",
+    "benchmark/mamba_pressure/instrumentation.py": "1249507c83259b6786f34c15813bb642f45aff1d20d7b883fca9e40256f36dee",
+    "benchmark/mamba_pressure/allocation_native.py": "469f8a2d2e95ab7c9cd3064c485a72efc799d6e75bbaa3ed1c7534de95477d74",
+    "python/sglang/srt/server_args.py": "7b98de3746115c29d86f5fce1f9e6fe7052cbf20ea01aaf42bbfde157ff8a24a",
+    "python/sglang/srt/mem_cache/memory_pool.py": "8efcfece984bc719a4e3a315d092131008ab45fe70dc82f75d6ba94d6e6d5caa",
+    "python/sglang/srt/mem_cache/mamba_allocation.py": "76b17f4f80fd34b3dc9723c0c1a4a441440e2eb3ab64d9dbac103cff209c5348",
+    "python/sglang/srt/mem_cache/mamba_radix_cache.py": "77987521c4bed83140887317844c9898ea5e048726cbd68617107dac7007cb9a",
+    "python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py": "2209a11a8d225a12ce5b03abe9e2f40eaa3182b34f72a89507740daa0ea19f83"
+  }
+}

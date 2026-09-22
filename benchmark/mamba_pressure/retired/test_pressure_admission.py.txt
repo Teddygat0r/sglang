@@ -1,0 +1,138 @@
+# Archived alongside the retired pressure-admission implementation.
+import asyncio
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+from types import SimpleNamespace as NS
+import unittest
+from unittest.mock import patch
+
+from pressure_admission import admit, install
+import pressure_sweep as sweep
+
+
+def fake_tree(free, count=6):
+    head = NS()
+    nodes = [NS(id=i, mamba_value=object(), mamba_compressed=False) for i in range(count)]
+    for i, node in enumerate(nodes):
+        node.previous = nodes[i + 1] if i + 1 < len(nodes) else head
+    tree = NS(enable_svd_compression=True, _pending_compression={},
+              req_to_token_pool=NS(mamba_pool=NS(size=16, available_size=lambda: free)),
+              mamba_lru_list=NS(head=head, tail=NS(previous=nodes[0] if nodes else head), prv='previous'),
+              _is_live_compression_node=lambda node: True)
+    calls = []
+    def enqueue(t, node):
+        calls.append(node.id)
+        t._pending_compression[node.id] = node
+    return tree, nodes, calls, enqueue
+
+
+class PressureAdmissionTests(unittest.TestCase):
+    def test_no_compression_with_headroom(self):
+        t, _, calls, enqueue = fake_tree(9)
+        admit(t, enqueue, 8, 12)
+        self.assertFalse(calls)
+
+    def test_low_watermark_admits_lru_until_projected_high(self):
+        t, _, calls, enqueue = fake_tree(8)
+        admit(t, enqueue, 8, 12)
+        self.assertEqual(calls, [0, 1, 2, 3])
+        self.assertFalse(t._admission_active)
+        admit(t, enqueue, 8, 12)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(t._admission_jobs, 4)
+
+    def test_pending_jobs_count_and_cancellation_releases_credit(self):
+        t, nodes, calls, enqueue = fake_tree(8)
+        t._pending_compression[0] = nodes[0]
+        t._pending_compression[1] = nodes[1]
+        admit(t, enqueue, 8, 12)
+        self.assertEqual(calls, [2, 3])
+        t._pending_compression.pop(0)
+        nodes[0].mamba_value = None
+        admit(t, enqueue, 8, 12)
+        self.assertEqual(calls, [2, 3, 4])
+
+    def test_hysteresis_continues_above_low_and_stops_at_high(self):
+        t, _, calls, enqueue = fake_tree(9)
+        t._admission_active = True
+        admit(t, enqueue, 8, 12)
+        self.assertEqual(calls, [0, 1, 2])
+        self.assertFalse(t._admission_active)
+        t.req_to_token_pool.mamba_pool.available_size = lambda: 12
+        t._pending_compression.clear()
+        admit(t, enqueue, 8, 12)
+        self.assertEqual(len(calls), 3)
+
+    def test_invalid_and_ineligible_candidates(self):
+        t, nodes, calls, enqueue = fake_tree(8)
+        nodes[0].mamba_value = None
+        nodes[1].mamba_compressed = True
+        t._is_live_compression_node = lambda n: n.id != 2
+        admit(t, enqueue, 8, 12)
+        self.assertEqual(calls, [3, 4, 5])
+        self.assertTrue(t._admission_active)
+        with self.assertRaises(ValueError):
+            admit(t, enqueue, 8, 17)
+        with self.assertRaises(ValueError):
+            install('pressure', 12, 8)
+
+    def test_failed_enqueue_and_disabled_compression(self):
+        t, _, calls, enqueue = fake_tree(8)
+        admit(t, lambda t, n: None, 8, 12)
+        self.assertFalse(t._pending_compression)
+        self.assertEqual(getattr(t, '_admission_jobs', 0), 0)
+        t.enable_svd_compression = False
+        admit(t, enqueue, 8, 12)
+        self.assertFalse(calls)
+
+    def test_actual_server_entrypoint_and_reset(self):
+        code = '''
+from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache, LRUList
+protected = ['_compression_worker', '_take_compression_result', '_invalidate_compression', '_process_compression_batch', '_free_mamba_state']
+original = {n:getattr(MambaRadixCache,n) for n in protected}
+import server
+assert server._admission == 'pressure'
+assert all(getattr(MambaRadixCache,n) is f for n,f in original.items() if n not in ('_process_compression_batch','_free_mamba_state'))
+from test_compression_jobs import cache
+t,node = cache()
+t.req_to_token_pool.mamba_pool.size = 16
+t.req_to_token_pool.mamba_pool.available_size = lambda: 8
+t.mamba_lru_list = LRUList(mamba=True)
+t.mamba_lru_list.insert_mru(node)
+t._enqueue_compression(node)
+assert node.id in t._compression_jobs
+job,_ = t._compression_queue.get_nowait()
+t._reset_compression_state()
+assert job.cancelled.is_set()
+assert t._admission_active is False and t._admission_jobs == 0
+'''
+        env = dict(os.environ, PRESSURE_ADMISSION='pressure', PRESSURE_LOW_WATERMARK='8', PRESSURE_HIGH_WATERMARK='12',
+                   PRESSURE_INDIVIDUAL_VARIANT='baseline', PRESSURE_PRE_OPTIMIZATION='0',
+                   PYTHONPATH=str(sweep.ROOT / 'python') + os.pathsep + str(sweep.HERE))
+        result = subprocess.run([sys.executable, '-c', code], env=env, cwd=sweep.ROOT, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_complete_supervisor_pairing(self):
+        calls = []
+        async def fake(args, c, rep, target, workload):
+            calls.append((args.pilot, c, rep, workload))
+            target.mkdir()
+            sweep.save(target / 'result.json', dict(config=c, repetition=rep, metrics={'test': float(c['admission']=='pressure')}, validation={'ok':True}))
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with patch.object(sweep, 'one_run', fake), patch.object(sweep, 'trace', side_effect=lambda args, rep: [args.seed, rep]):
+                asyncio.run(sweep.experiment(root))
+            self.assertEqual(len(calls), 12)
+            for rep in range(5):
+                rows = [c for c in calls if not c[0] and c[2] == rep]
+                self.assertEqual([c[1]['admission'] for c in rows], ['eager','pressure'] if rep%2==0 else ['pressure','eager'])
+                self.assertEqual(rows[0][3], rows[1][3])
+            self.assertEqual(json.loads((root/'summary.json').read_text())['paired']['pressure_8_12']['test']['ci95'], [1.0,1.0])
+
+
+if __name__ == '__main__':
+    unittest.main()

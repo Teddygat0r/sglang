@@ -1,0 +1,237 @@
+diff --git a/python/sglang/srt/mem_cache/mamba_radix_cache.py b/python/sglang/srt/mem_cache/mamba_radix_cache.py
+index b4b7c56a2..63635a786 100644
+--- a/python/sglang/srt/mem_cache/mamba_radix_cache.py
++++ b/python/sglang/srt/mem_cache/mamba_radix_cache.py
+@@ -54,6 +54,7 @@ from sglang.srt.mem_cache.radix_cache import (
+     _key_match_paged,
+     get_child_key,
+ )
++from sglang.srt.mem_cache.rsvd_eigh import randomized_svd_eigh
+ from sglang.srt.server_args import get_global_server_args
+ 
+ if TYPE_CHECKING:
+@@ -456,6 +457,12 @@ class MambaRadixCache(BasePrefixCache):
+             server_args, "mamba_svd_compression", False
+         )
+         self.svd_rank = getattr(server_args, "mamba_svd_rank", 16)
++        self.svd_niter = getattr(server_args, "mamba_svd_niter", 1)
++        self.svd_oversample = getattr(server_args, "mamba_svd_oversample", 4)
++        # Greedy worker batch cap: how many pending snapshots to fold into one
++        # batched SVD call. Larger amortizes kernel launches; bounded so a burst
++        # of completions can't build an unboundedly large transient tensor.
++        self.svd_worker_batch = getattr(server_args, "mamba_svd_worker_batch", 8)
+         self._compression_thread: Optional[threading.Thread] = None
+         self._compression_stop_event: Optional[threading.Event] = None
+         if self.enable_svd_compression and self.req_to_token_pool.mamba_pool is not None:
+@@ -1032,6 +1039,13 @@ class MambaRadixCache(BasePrefixCache):
+         self._compression_done_queue: queue.Queue = queue.Queue()
+         self._compression_stop_event = threading.Event()
+         self._max_inflight_compression = 8
++        # Dedicated CUDA stream so SVD kernels overlap with inference instead
++        # of serializing on the default stream.
++        self._svd_device = pool.mamba_cache.temporal.device
++        if self._svd_device.type == "cuda":
++            self._svd_stream = torch.cuda.Stream(device=self._svd_device)
++        else:
++            self._svd_stream = None
+         # # Diagnostic counters — cheap, always on. Inspect via tree._compression_stats().
+         # self._svd_enqueued = 0
+         # self._svd_enqueue_skipped_inflight = 0
+@@ -1098,7 +1112,14 @@ class MambaRadixCache(BasePrefixCache):
+     #     }
+ 
+     def _enqueue_compression(self, node: TreeNode) -> None:
+-        """Snapshot the node's full-rank state to CPU and post to the SVD worker."""
++        """Snapshot the node's full-rank state and post to the SVD worker.
++
++        The snapshot clone is issued on the *SVD stream*, not the default
++        (inference) stream, so the ~50-100MB copy does not contend with decode.
++        An event recorded on the current stream makes the SVD stream wait for
++        the prefill write that produced this slot before it reads. The host
++        cost of this method is just an event record plus a kernel launch on the
++        side stream, so the scheduler thread is not stalled by the copy."""
+         if not self.enable_svd_compression:
+             return
+         if node.mamba_value is None or node.mamba_compressed:
+@@ -1113,47 +1134,98 @@ class MambaRadixCache(BasePrefixCache):
+         pool = self.req_to_token_pool.mamba_pool
+         # pool.mamba_cache.temporal shape is [L, N, H, D, S]; mamba_value is a [1] slot tensor
+         try:
+-            cpu_state = (
+-                pool.mamba_cache.temporal[:, node.mamba_value]
+-                .squeeze(1)
+-                .detach()
+-                .cpu()
+-                .float()
+-            )
++            src = pool.mamba_cache.temporal[:, node.mamba_value].squeeze(1).detach()
++            if self._svd_stream is not None:
++                event = torch.cuda.Event()
++                event.record()  # default stream: orders after the prefill write
++                with torch.cuda.stream(self._svd_stream):
++                    self._svd_stream.wait_event(event)
++                    gpu_snapshot = src.clone()  # clone runs on the SVD stream
++            else:
++                gpu_snapshot = src.clone()
+         except Exception as e:
+             logger.warning("Failed to snapshot mamba state for node %s: %s", node.id, e)
+             return
+ 
+         self._pending_compression[node.id] = node
+-        self._compression_queue.put((node.id, cpu_state))
++        self._compression_queue.put((node.id, gpu_snapshot))
+ 
+     def _compression_worker(self) -> None:
+-        """Background daemon thread: pops CPU snapshots, runs SVD, posts packed results."""
+-        rank = self.svd_rank
++        """Background daemon thread: pops GPU snapshots, runs a single *batched*
++        randomized SVD on a side CUDA stream over all snapshots immediately
++        available (up to svd_worker_batch), blocks the worker (not the
++        scheduler) until the GPU work completes, then publishes packed tensors.
++
++        Batching matters: every snapshot is the same shape [L, H, D, S], so
++        stacking K of them into [K, L, H, D, S] lets one rsvd_eigh call cover
++        the whole group. That amortizes kernel-launch overhead and keeps the
++        SVD kernels large enough to run efficiently, which shortens the total
++        time the side stream competes with inference for SMs."""
+         stop_event = self._compression_stop_event
++        if self._svd_device.type == "cuda":
++            torch.cuda.set_device(self._svd_device)
+         while not stop_event.is_set():
+             try:
+-                item = self._compression_queue.get(block=True, timeout=1.0)
++                first = self._compression_queue.get(block=True, timeout=1.0)
+             except queue.Empty:
+                 continue
+-            if item is None:
++            if first is None:
+                 continue
+-            node_id, cpu_state = item
++            # Greedily gather any other snapshots already waiting, so a backlog
++            # collapses into one batched SVD instead of N serial ones.
++            batch = [first]
++            while len(batch) < self.svd_worker_batch:
++                try:
++                    nxt = self._compression_queue.get_nowait()
++                except queue.Empty:
++                    break
++                if nxt is not None:
++                    batch.append(nxt)
+             try:
+-                L, H, D, S = cpu_state.shape
+-                q = min(rank + 4, min(D, S))
+-                u, s, v = torch.svd_lowrank(cpu_state, q=q, niter=1)
+-                u = u[..., :rank].reshape(L, H, D * rank)
+-                s = s[..., :rank]
+-                v = v[..., :rank].reshape(L, H, S * rank)
+-                packed = torch.cat([u, s, v], dim=-1)  # [L, H, (D+1+S)*r]
++                self._process_compression_batch(batch)
+             except Exception as e:
+-                logger.warning("Async SVD failed for node %s: %s", node_id, e)
+-                continue
+-            self._compression_done_queue.put((node_id, packed))
++                node_ids = [b[0] for b in batch]
++                logger.warning("Async SVD batch failed for nodes %s: %s", node_ids, e)
+ 
+-    def drain_compression_completions(self, max_per_call: int = 32) -> None:
+-        """Main-thread drain: commit completed SVD packs into the compressed pool."""
++    def _process_compression_batch(self, batch: List[Tuple[int, torch.Tensor]]) -> None:
++        """Run one batched SVD over `batch` snapshots and post packed results."""
++        rank = self.svd_rank
++        node_ids = [b[0] for b in batch]
++        snapshots = [b[1] for b in batch]
++        K = len(snapshots)
++        L, H, D, S = snapshots[0].shape
++        effective_rank = min(rank, D, S)
++
++        def _run():
++            stacked = torch.stack(snapshots, dim=0)  # [K, L, H, D, S]
++            u, s, vh = randomized_svd_eigh(
++                stacked,
++                rank=effective_rank,
++                n_iter=self.svd_niter,
++                oversample=self.svd_oversample,
++            )
++            u_flat = u.reshape(K, L, H, D * effective_rank)
++            v_flat = vh.transpose(-2, -1).reshape(K, L, H, S * effective_rank)
++            packed = torch.cat([u_flat, s, v_flat], dim=-1)  # [K, L, H, (D+1+S)*r]
++            return packed
++
++        if self._svd_stream is not None:
++            with torch.cuda.stream(self._svd_stream):
++                packed = _run()
++            self._svd_stream.synchronize()
++        else:
++            packed = _run()
++
++        for i, node_id in enumerate(node_ids):
++            self._compression_done_queue.put((node_id, packed[i]))
++
++    def drain_compression_completions(self, max_per_call: int = 8) -> None:
++        """Main-thread drain: commit completed SVD packs into the compressed pool.
++
++        Capped low (8) so a burst of completions does not fire many GPU->GPU
++        commit copies on the inference (default) stream in a single scheduler
++        step, which would spike decode latency. Remaining completions are
++        committed on subsequent steps."""
+         if not self.enable_svd_compression:
+             return
+         pool = self.req_to_token_pool.mamba_pool
+@@ -1178,12 +1250,10 @@ class MambaRadixCache(BasePrefixCache):
+             c_slot = self._compressed_free_slots.pop()
+             full_slot = node.mamba_value
+             # 1. Write compressed temporal + conv to the new compressed slot.
++            # `packed` already lives on the same CUDA device as compressed_temporal
++            # (produced by the GPU SVD worker); .to() is a dtype cast only.
+             self.compressed_temporal[c_slot].copy_(
+-                packed.to(
+-                    device=self.device,
+-                    dtype=self.compressed_temporal.dtype,
+-                    non_blocking=True,
+-                )
++                packed.to(dtype=self.compressed_temporal.dtype)
+             )
+             for i, conv_t in enumerate(pool.mamba_cache.conv):
+                 self.compressed_conv[i][c_slot].copy_(
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 134e8dea2..98b56da24 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -547,6 +547,9 @@ class ServerArgs:
+     max_mamba_cache_size: Optional[int] = None
+     mamba_svd_compression: bool = False
+     mamba_svd_rank: int = 16
++    mamba_svd_niter: int = 1
++    mamba_svd_oversample: int = 4
++    mamba_svd_worker_batch: int = 8
+     mamba_ssm_dtype: Optional[str] = None
+     mamba_full_memory_ratio: float = 0.9
+     mamba_scheduler_strategy: str = "auto"
+@@ -5050,6 +5053,27 @@ class ServerArgs:
+             default=ServerArgs.mamba_svd_rank,
+             help="Target rank for SVD compression of mamba temporal states.",
+         )
++        parser.add_argument(
++            "--mamba-svd-niter",
++            type=int,
++            default=ServerArgs.mamba_svd_niter,
++            help="Power iterations for randomized SVD of mamba states. Lower is "
++            "faster (less side-stream compute); higher is more accurate.",
++        )
++        parser.add_argument(
++            "--mamba-svd-oversample",
++            type=int,
++            default=ServerArgs.mamba_svd_oversample,
++            help="Oversampling columns beyond the target rank for randomized SVD "
++            "of mamba states. Lower is faster; higher tightens the approximation.",
++        )
++        parser.add_argument(
++            "--mamba-svd-worker-batch",
++            type=int,
++            default=ServerArgs.mamba_svd_worker_batch,
++            help="Max pending mamba-state snapshots folded into one batched SVD "
++            "call by the async worker. Larger amortizes kernel-launch overhead.",
++        )
+         parser.add_argument(
+             "--max-mamba-cache-size",
+             type=int,

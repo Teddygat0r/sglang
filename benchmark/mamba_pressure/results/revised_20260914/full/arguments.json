@@ -1,0 +1,15 @@
+{
+  "results": "/home/joshuaz/sglang/benchmark/mamba_pressure/results/revised_20260914/full",
+  "budgets": [
+    24,
+    192
+  ],
+  "repetitions": 6,
+  "groups": 64,
+  "rounds": 3,
+  "prefix": 2048,
+  "output": 8,
+  "kv_tokens": 262144,
+  "seed": 20260913,
+  "port": 31035
+}

@@ -179,6 +179,35 @@ class ModelRunnerKVCacheMixin:
         server_args = self.server_args
         assert config is not None
 
+        # Opt-in allocation: account for dense storage (including its sentinel),
+        # compressed storage and declared staging before sizing the KV pool.
+        # The staging reserve is not a runtime bound on asynchronous queues.
+        if getattr(server_args, "mamba_svd_cache_size", None) is not None:
+            from sglang.srt.mem_cache.mamba_allocation import (
+                explicit_mamba_bytes,
+                validate_explicit_allocation,
+            )
+
+            validate_explicit_allocation(server_args)
+            reserved = explicit_mamba_bytes(
+                config.mamba2_cache_params,
+                server_args.max_mamba_cache_size,
+                server_args.mamba_svd_cache_size,
+                server_args.mamba_svd_rank,
+                server_args.mamba_svd_staging_reserve_bytes,
+            )
+            if reserved >= int(total_rest_memory * (1 << 30)):
+                raise ValueError("Explicit Mamba allocation leaves no memory for KV cache")
+            logger.info(
+                "Explicit Mamba allocation: full=%d compressed=%d staging=%d "
+                "reserved_bytes=%d (including dense sentinel)",
+                server_args.max_mamba_cache_size,
+                server_args.mamba_svd_cache_size,
+                server_args.mamba_svd_staging_reserve_bytes,
+                reserved,
+            )
+            return total_rest_memory - reserved / (1 << 30)
+
         # reserve the memory for the intermediate mamba states used for spec dec
         if not self.spec_algorithm.is_none():
             assert server_args.speculative_num_draft_tokens is not None

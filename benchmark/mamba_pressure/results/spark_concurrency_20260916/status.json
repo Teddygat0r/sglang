@@ -1,0 +1,6 @@
+{
+  "state": "complete",
+  "measured_runs": 60,
+  "pilot_runs": 4,
+  "report": "/home/joshuaz/sglang/benchmark/mamba_pressure/results/spark_concurrency_20260916/report.md"
+}

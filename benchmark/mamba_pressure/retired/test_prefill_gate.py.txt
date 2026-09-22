@@ -1,0 +1,67 @@
+# Historical test, archived with the exclusion policy.
+import threading
+import unittest
+from prefill_gate import PrefillGate
+
+
+class GateTests(unittest.TestCase):
+    def test_prefill_blocks_svd(self):
+        gate = PrefillGate()
+        started, entered = threading.Event(), threading.Event()
+        def worker():
+            started.set()
+            with gate.enter('svd') as ok:
+                self.assertTrue(ok)
+                entered.set()
+        with gate.enter('prefill'):
+            thread = threading.Thread(target=worker)
+            thread.start()
+            self.assertTrue(started.wait(1))
+            self.assertFalse(entered.wait(.05))
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(entered.is_set())
+
+    def test_inflight_svd_delays_prefill_and_prefill_has_priority(self):
+        gate = PrefillGate()
+        order = []
+        def worker(kind):
+            with gate.enter(kind):
+                order.append(kind)
+        with gate.enter('svd'):
+            prefill = threading.Thread(target=worker, args=('prefill',))
+            prefill.start()
+            with gate.condition:
+                self.assertTrue(gate.condition.wait_for(lambda: gate.prefill_waiters == 1, timeout=1))
+            svd = threading.Thread(target=worker, args=('svd',))
+            svd.start()
+            self.assertEqual(order, [])
+        prefill.join(2)
+        svd.join(2)
+        self.assertEqual(order, ['prefill', 'svd'])
+
+    def test_exception_releases_gate(self):
+        gate = PrefillGate()
+        with self.assertRaises(RuntimeError):
+            with gate.enter('prefill'):
+                raise RuntimeError('injected')
+        with gate.enter('svd') as acquired:
+            self.assertTrue(acquired)
+
+    def test_stop_cancels_waiting_worker(self):
+        gate, stop = PrefillGate(), threading.Event()
+        result = []
+        def worker():
+            with gate.enter('svd', stop) as acquired:
+                result.append(acquired)
+        with gate.enter('prefill'):
+            thread = threading.Thread(target=worker)
+            thread.start()
+            stop.set()
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(result, [False])
+
+
+if __name__ == '__main__':
+    unittest.main()

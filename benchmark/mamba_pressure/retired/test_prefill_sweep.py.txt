@@ -1,0 +1,74 @@
+# Historical test, archived with the exclusion policy.
+import asyncio
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+import prefill_sweep as sweep
+
+
+class PrefillSweepTests(unittest.TestCase):
+    def test_schedule(self):
+        calls = []
+        async def fake(args, cfg, rep, target, workload):
+            calls.append((args.pilot, cfg, rep, workload))
+            target.mkdir(parents=True)
+            sweep.save(target / 'result.json', dict(config=cfg, repetition=rep,
+                metrics={'ttft': float(cfg['label'] == 'strict')}, validation={'ok': True}))
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with patch.object(sweep, 'one_run', fake):
+                asyncio.run(sweep.experiment(root))
+            self.assertEqual(len(calls), 18)
+            for rep in range(5):
+                rows = [r for r in calls if not r[0] and r[2] == rep]
+                order = ['baseline', 'sync_control', 'strict']
+                self.assertEqual([r[1]['label'] for r in rows], order[::-1] if rep % 2 else order)
+                self.assertTrue(all(r[3] == rows[0][3] for r in rows))
+            summary = json.loads((root / 'summary.json').read_text())
+            self.assertEqual(summary['paired_vs_baseline']['strict']['ttft']['ci95'], [1., 1.])
+
+    def test_actual_hooks_cancellation_and_completion_boundary(self):
+        code = '''
+import os, threading
+from types import SimpleNamespace as NS
+from unittest.mock import patch
+import torch
+import server
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+assert not getattr(Scheduler, '_prefill_gate_mode', None)
+calls = []
+Scheduler.run_batch = lambda *a, **k: calls.append('forward')
+MambaRadixCache._process_compression_batch = lambda tree, batch: calls.append(('svd', len(batch)))
+import prefill_server
+stream = NS(synchronize=lambda: calls.append('svd_done'))
+event = NS(record=lambda s: calls.append('event'), synchronize=lambda: calls.append('prefill_done'))
+with patch.object(torch.cuda, 'Event', return_value=event), patch.object(torch.cuda, 'current_stream', return_value=stream):
+    Scheduler.run_batch(NS(), NS(forward_mode=NS(is_extend_or_draft_extend_or_mixed=lambda: True)))
+assert calls == ['forward', 'event', 'prefill_done']
+calls.clear()
+tree = NS(_compression_stop_event=threading.Event(), _svd_stream=stream,
+          _is_live_compression_item=lambda item: not item[0].cancelled.is_set())
+live, cancelled = NS(cancelled=threading.Event()), NS(cancelled=threading.Event())
+cancelled.cancelled.set()
+MambaRadixCache._process_compression_batch(tree, [(live,None),(cancelled,None)])
+assert calls == [('svd',1), 'svd_done']
+calls.clear()
+Scheduler.run_batch(NS(), NS(forward_mode=NS(is_extend_or_draft_extend_or_mixed=lambda: False)))
+assert calls == ['forward']
+'''
+        env = dict(os.environ, PRESSURE_PREFILL_GATE='strict', PRESSURE_PRE_OPTIMIZATION='0',
+                   PRESSURE_INDIVIDUAL_VARIANT='baseline',
+                   PYTHONPATH=str(sweep.ROOT / 'python') + os.pathsep + str(Path(sweep.__file__).parent))
+        result = subprocess.run([sys.executable, '-c', code], env=env, cwd=sweep.ROOT,
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+if __name__ == '__main__':
+    unittest.main()
