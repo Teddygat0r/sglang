@@ -1501,11 +1501,9 @@ class MambaRadixCache(BasePrefixCache):
         """Reconstruct full mamba state at dst_index from either compressed or full-rank source."""
         pool = self.req_to_token_pool.mamba_pool
         if not src_node.mamba_compressed:
-            logger.info(f"Full-rank mamba state from {src_node.id} to {dst_index}")
             pool.copy_from(src_node.mamba_value, dst_index)
             return
 
-        logger.info(f"Decompressing compressed mamba state from {src_node.id} to {dst_index}")
         rank = self.svd_rank
         c_slot = src_node.compressed_slot
         packed = self.compressed_temporal[c_slot]  # [L, H, (D+1+S)*r]
