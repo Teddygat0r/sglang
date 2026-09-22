@@ -27,6 +27,9 @@ def validate_explicit_allocation(args):
             )
     if getattr(args, "mamba_svd_max_pending", 8) < 1:
         raise ValueError("mamba_svd_max_pending must be positive")
+    for name, default in (("mamba_svd_niter", 1), ("mamba_svd_oversample", 4)):
+        if getattr(args, name, default) < 0:
+            raise ValueError(f"{name} must be non-negative")
     slots = getattr(args, "mamba_svd_cache_size", None)
     reserve = getattr(args, "mamba_svd_staging_reserve_bytes", 0)
     if reserve < 0:

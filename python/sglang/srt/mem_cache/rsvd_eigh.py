@@ -66,11 +66,11 @@ def randomized_svd_eigh(
     rank:
         Target rank k. Must satisfy `rank <= min(m, n)`.
     n_iter:
-        Number of subspace (power) iterations. Each iteration does
+        Non-negative number of subspace (power) iterations. Each iteration does
         `Y = A · (Aᵀ · Q)` then re-orthonormalizes.
     oversample:
-        Extra sketch columns beyond `rank`. The sketch dimension is
-        `q = min(rank + oversample, m, n)`. Larger sketches increase
+        Non-negative number of extra sketch columns beyond `rank`. The sketch
+        dimension is `q = min(rank + oversample, m, n)`. Larger sketches increase
         computation and can improve the approximation.
     power_dtype:
         Optional dtype for the power-iteration matmuls. Defaults to
@@ -95,6 +95,11 @@ def randomized_svd_eigh(
     m, n = A.shape[-2], A.shape[-1]
     if rank <= 0 or rank > min(m, n):
         raise ValueError(f"rank must be in [1, min(m, n) = {min(m, n)}], got {rank}")
+
+    if n_iter < 0:
+        raise ValueError(f"n_iter must be non-negative, got {n_iter}")
+    if oversample < 0:
+        raise ValueError(f"oversample must be non-negative, got {oversample}")
 
     q = min(rank + oversample, m, n)
     pdtype = power_dtype if power_dtype is not None else A.dtype
