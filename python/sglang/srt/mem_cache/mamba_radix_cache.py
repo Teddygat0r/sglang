@@ -1098,18 +1098,6 @@ class MambaRadixCache(BasePrefixCache):
             self._svd_stream = torch.cuda.Stream(device=self._svd_device)
         else:
             self._svd_stream = None
-        # # Diagnostic counters — cheap, always on. Inspect via tree._compression_stats().
-        # self._svd_enqueued = 0
-        # self._svd_enqueue_skipped_inflight = 0
-        # self._svd_enqueue_skipped_no_slot = 0
-        # self._svd_worker_processed = 0
-        # self._svd_worker_failed = 0
-        # self._svd_committed = 0
-        # self._svd_dropped_evicted = 0
-        # self._svd_dropped_locked = 0
-        # self._svd_dropped_pool_full = 0
-        # self._svd_decompress_hits = 0
-
         compressed_bytes = (
             self.compressed_temporal.element_size() * self.compressed_temporal.numel()
             + sum(c.element_size() * c.numel() for c in self.compressed_conv)
@@ -1136,32 +1124,6 @@ class MambaRadixCache(BasePrefixCache):
             self._compression_thread.is_alive(),
             self._compression_thread.daemon,
         )
-
-    # def _compression_stats(self) -> dict:
-    #     """Diagnostic snapshot of compression pipeline state."""
-    #     if not self.enable_svd_compression:
-    #         return {"enable_svd_compression": False}
-    #     return {
-    #         "enable_svd_compression": True,
-    #         "worker_alive": bool(
-    #             self._compression_thread and self._compression_thread.is_alive()
-    #         ),
-    #         "work_queue_depth": self._compression_queue.qsize(),
-    #         "done_queue_depth": self._compression_done_queue.qsize(),
-    #         "pending": len(self._pending_compression),
-    #         "compressed_lru_size": len(self._compressed_lru),
-    #         "compressed_free_slots": len(self._compressed_free_slots),
-    #         "enqueued_total": self._svd_enqueued,
-    #         "enqueue_skipped_inflight": self._svd_enqueue_skipped_inflight,
-    #         "enqueue_skipped_no_slot": self._svd_enqueue_skipped_no_slot,
-    #         "worker_processed_total": self._svd_worker_processed,
-    #         "worker_failed_total": self._svd_worker_failed,
-    #         "committed_total": self._svd_committed,
-    #         "dropped_evicted": self._svd_dropped_evicted,
-    #         "dropped_locked": self._svd_dropped_locked,
-    #         "dropped_pool_full": self._svd_dropped_pool_full,
-    #         "decompress_hits": self._svd_decompress_hits,
-    #     }
 
     def _reset_compression_state(self) -> None:
         """Drop async SVD work and restore the compressed pool to an empty state."""
@@ -1370,7 +1332,6 @@ class MambaRadixCache(BasePrefixCache):
         if not self.enable_svd_compression:
             return
         pool = self.req_to_token_pool.mamba_pool
-        rank = self.svd_rank
         for _ in range(max_per_call):
             try:
                 failed_job = self._compression_failed_queue.get_nowait()
