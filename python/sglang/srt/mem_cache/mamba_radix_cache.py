@@ -23,7 +23,6 @@ import heapq
 import queue
 import threading
 from collections import OrderedDict, defaultdict
-from dataclasses import dataclass, field
 from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -48,6 +47,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.compression_coordinator import (
+    CompressionJob,
+    TPCompressionCoordinator,
+)
 from sglang.srt.mem_cache.compression_staging import CompressionStaging
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import (
@@ -66,15 +69,6 @@ if TYPE_CHECKING:
 import logging
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True, eq=False)
-class CompressionJob:
-    """Unique state-version token; workers see no mutable radix-tree metadata."""
-
-    node_id: int
-    ready: Optional[torch.cuda.Event] = None
-    cancelled: threading.Event = field(default_factory=threading.Event)
 
 
 class TreeNode:
@@ -467,6 +461,16 @@ class MambaRadixCache(BasePrefixCache):
         self.enable_svd_compression = getattr(
             server_args, "mamba_svd_compression", False
         )
+        self._compression_tp_group = getattr(params, "tp_cache_group", None)
+        if self.enable_svd_compression and getattr(server_args, "tp_size", 1) > 1:
+            if (
+                self._compression_tp_group is None
+                or torch.distributed.get_world_size(self._compression_tp_group)
+                != server_args.tp_size
+            ):
+                raise ValueError(
+                    "Tensor-parallel compression requires a matching TP cache process group"
+                )
         self.svd_rank = getattr(server_args, "mamba_svd_rank", 16)
         self.svd_niter = getattr(server_args, "mamba_svd_niter", 1)
         self.svd_oversample = getattr(server_args, "mamba_svd_oversample", 4)
@@ -1087,6 +1091,15 @@ class MambaRadixCache(BasePrefixCache):
             temporal_dtype,
             self.device,
         )
+        self._compression_coordinator = None
+        group = getattr(self, "_compression_tp_group", None)
+        if group is not None and torch.distributed.get_world_size(group) > 1:
+            self._compression_coordinator = TPCompressionCoordinator(
+                group,
+                self._compression_staging.buffer.shape[0],
+                pool.size,
+                num_compressed_slots,
+            )
         self._compression_queue: queue.Queue = queue.Queue()
         self._compression_done_queue: queue.Queue = queue.Queue()
         self._compression_failed_queue: queue.Queue = queue.Queue()
@@ -1094,6 +1107,10 @@ class MambaRadixCache(BasePrefixCache):
         # Dedicated CUDA stream so SVD kernels overlap with inference instead
         # of serializing on the default stream.
         self._svd_device = pool.mamba_cache.temporal.device
+        self._svd_generator = torch.Generator(device=self._svd_device)
+        self._svd_generator.manual_seed(
+            getattr(get_global_server_args(), "random_seed", 0) or 0
+        )
         if self._svd_device.type == "cuda":
             self._svd_stream = torch.cuda.Stream(device=self._svd_device)
         else:
@@ -1127,6 +1144,9 @@ class MambaRadixCache(BasePrefixCache):
 
     def _reset_compression_state(self) -> None:
         """Drop async SVD work and restore the compressed pool to an empty state."""
+        coordinator = getattr(self, "_compression_coordinator", None)
+        if coordinator is not None:
+            coordinator.reset()
         for job in self._compression_jobs.values():
             job.cancelled.set()
         self._compression_jobs.clear()
@@ -1145,7 +1165,11 @@ class MambaRadixCache(BasePrefixCache):
                 return
             if item is not None:
                 job = item[0] if isinstance(item, tuple) else item
-                self._compression_staging.release(job)
+                coordinator = getattr(self, "_compression_coordinator", None)
+                if coordinator is None:
+                    self._compression_staging.release(job)
+                else:
+                    coordinator.finish(job, None)
 
     def _is_live_compression_node(self, node: TreeNode) -> bool:
         cur = node
@@ -1174,8 +1198,18 @@ class MambaRadixCache(BasePrefixCache):
 
         ready = torch.cuda.Event() if self._svd_stream is not None else None
         job = CompressionJob(node.id, ready=ready)
+        coordinator = getattr(self, "_compression_coordinator", None)
+        if coordinator is not None:
+            if not coordinator.register(job):
+                return
+            # Register the same attempt everywhere, even if this rank cannot
+            # snapshot it. Admission depends only on coordinated retirement.
+            self._pending_compression[node.id] = node
+            self._compression_jobs[node.id] = job
         snapshot = self._compression_staging.acquire(job)
         if snapshot is None:
+            if coordinator is not None:
+                self._compression_failed_queue.put(job)
             return
         pool = self.req_to_token_pool.mamba_pool
         try:
@@ -1190,7 +1224,10 @@ class MambaRadixCache(BasePrefixCache):
             if ready is not None:
                 ready.record()
         except Exception as e:
-            self._compression_staging.release(job)
+            if coordinator is None:
+                self._compression_staging.release(job)
+            else:
+                self._compression_failed_queue.put(job)
             logger.warning("Failed to snapshot mamba state for node %s: %s", node.id, e)
             return
 
@@ -1256,7 +1293,7 @@ class MambaRadixCache(BasePrefixCache):
                 cancelled=lambda: all(item[0].cancelled.is_set() for item in batch),
             ):
                 for job, _ in batch:
-                    self._compression_staging.release(job)
+                    self._acknowledge_cancelled_compression(job)
                 continue
             # Eviction/reset can cancel work while admission is deferred.
             batch = self._discard_cancelled_compression(batch)
@@ -1277,8 +1314,16 @@ class MambaRadixCache(BasePrefixCache):
             if self._is_live_compression_item(item):
                 live.append(item)
             else:
-                self._compression_staging.release(item[0])
+                self._acknowledge_cancelled_compression(item[0])
         return live
+
+    def _acknowledge_cancelled_compression(self, job: CompressionJob) -> None:
+        if getattr(self, "_compression_coordinator", None) is None:
+            self._compression_staging.release(job)
+        else:
+            # Workers only acknowledge completion. The scheduler returns the
+            # staging reservation after every rank has stopped reading it.
+            self._compression_failed_queue.put(job)
 
     def _is_live_compression_item(self, item: Tuple[CompressionJob, torch.Tensor]) -> bool:
         """Worker cancellation check; never read or mutate tree/pending metadata."""
@@ -1300,6 +1345,7 @@ class MambaRadixCache(BasePrefixCache):
                 rank=effective_rank,
                 n_iter=self.svd_niter,
                 oversample=self.svd_oversample,
+                generator=getattr(self, "_svd_generator", None),
             )
             u_flat = u.reshape(K, L, H, D * effective_rank)
             v_flat = vh.transpose(-2, -1).reshape(K, L, H, S * effective_rank)
@@ -1322,6 +1368,54 @@ class MambaRadixCache(BasePrefixCache):
         for i, node_id in enumerate(node_ids):
             self._compression_done_queue.put((node_id, packed[i]))
 
+    def _valid_compression_result(self, job: CompressionJob) -> bool:
+        node = self._pending_compression.get(job.node_id)
+        return (
+            self._compression_jobs.get(job.node_id) is job
+            and node is not None
+            and node.mamba_value is not None
+            and not node.mamba_compressed
+            and self._is_live_compression_node(node)
+        )
+
+    def _collect_compression_results(
+        self, max_per_call: int
+    ) -> List[Tuple[CompressionJob, Optional[torch.Tensor]]]:
+        coordinator = getattr(self, "_compression_coordinator", None)
+        if coordinator is None:
+            for _ in range(max_per_call):
+                try:
+                    job = self._compression_failed_queue.get_nowait()
+                except queue.Empty:
+                    break
+                self._take_compression_result(job)
+            results = []
+            for _ in range(max_per_call):
+                try:
+                    results.append(self._compression_done_queue.get_nowait())
+                except queue.Empty:
+                    break
+            return results
+
+        # Local notifications never release TP admission slots or alter the
+        # tree. Queue size is bounded by the outstanding job reservations.
+        for q, failed in (
+            (self._compression_failed_queue, True),
+            (self._compression_done_queue, False),
+        ):
+            while True:
+                try:
+                    item = q.get_nowait()
+                except queue.Empty:
+                    break
+                job, packed = (item, None) if failed else item
+                coordinator.finish(job, packed)
+        results = coordinator.poll(self._valid_compression_result, max_per_call)
+        for job in tuple(self._compression_jobs.values()):
+            if job.cancelled.is_set():
+                self._invalidate_compression(job.node_id)
+        return results
+
     def drain_compression_completions(self, max_per_call: int = 8) -> None:
         """Main-thread drain: commit completed SVD packs into the compressed pool.
 
@@ -1332,19 +1426,9 @@ class MambaRadixCache(BasePrefixCache):
         if not self.enable_svd_compression:
             return
         pool = self.req_to_token_pool.mamba_pool
-        for _ in range(max_per_call):
-            try:
-                failed_job = self._compression_failed_queue.get_nowait()
-            except queue.Empty:
-                break
-            self._take_compression_result(failed_job)
-        for _ in range(max_per_call):
-            try:
-                job, packed = self._compression_done_queue.get_nowait()
-            except queue.Empty:
-                return
+        for job, packed in self._collect_compression_results(max_per_call):
             node = self._take_compression_result(job)
-            if node is None:
+            if node is None or packed is None:
                 continue
             if (
                 node.mamba_value is None

@@ -23,7 +23,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-small")
 
 
-def _create_pool_resources(device):
+def _create_pool_resources(device, tp_world_size=1):
     """Create shared pool resources (small model for testing)."""
     num_layers = 4
     global_interval = 2
@@ -34,7 +34,7 @@ def _create_pool_resources(device):
 
     with envs.SGLANG_MAMBA_SSM_DTYPE.override("float32"):
         shape = Mamba2StateShape.create(
-            tp_world_size=1,
+            tp_world_size=tp_world_size,
             intermediate_size=64,
             n_groups=2,
             num_heads=4,
@@ -60,7 +60,7 @@ def _create_pool_resources(device):
         size=128,
         dtype=torch.float32,
         page_size=1,
-        head_num=2,
+        head_num=2 // tp_world_size,
         head_dim=32,
         full_attention_layer_ids=full_attention_layer_ids,
         enable_kvcache_transpose=False,

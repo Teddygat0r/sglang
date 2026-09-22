@@ -50,6 +50,7 @@ def randomized_svd_eigh(
     n_iter: int = 2,
     oversample: int = 8,
     power_dtype: torch.dtype | None = None,
+    generator: torch.Generator | None = None,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """
     Randomized truncated SVD with eigh-on-Gram and fp64 Cholesky-QR.
@@ -78,6 +79,10 @@ def randomized_svd_eigh(
         fp64 and the projection + eigh run in fp32 regardless, for
         numerical safety.
 
+    generator:
+        Optional independent RNG for background callers, to avoid changing
+        inference or sampling RNG state as asynchronous batch sizes vary.
+
     Returns
     -------
     U  : [..., m, rank]
@@ -96,7 +101,7 @@ def randomized_svd_eigh(
     Ap = A.to(pdtype) if pdtype != A.dtype else A
 
     # Initial Gaussian sketch.
-    Omega = torch.randn(n, q, dtype=Ap.dtype, device=A.device)
+    Omega = torch.randn(n, q, dtype=Ap.dtype, device=A.device, generator=generator)
     Y = Ap @ Omega
     if pdtype != torch.float32:
         Y = Y.float()

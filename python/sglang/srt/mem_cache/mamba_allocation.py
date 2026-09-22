@@ -4,14 +4,27 @@ from math import prod
 
 
 def validate_explicit_allocation(args):
-    # Compression commits change cache capacity and may evict prefix nodes.
-    # Until completions are coordinated across ranks, each worker must own
-    # the entire model so asynchronous completion cannot diverge TP batches.
     if (
         getattr(args, "mamba_svd_compression", False)
-        and getattr(args, "tp_size", 1) != 1
+        and getattr(args, "tp_size", 1) > 1
     ):
-        raise ValueError("Mamba SVD compression currently requires --tp-size 1")
+        # The collective drain is wired into the standard autoregressive
+        # scheduler, using its CPU TP cache group on every scheduling step.
+        unsupported = (
+            getattr(args, "dp_size", 1) != 1
+            or getattr(args, "pp_size", 1) != 1
+            or getattr(args, "speculative_algorithm", None)
+            or getattr(args, "dllm_algorithm", None)
+            or getattr(args, "enable_pdmux", False)
+            or getattr(args, "disaggregation_mode", "null") != "null"
+            or getattr(args, "enable_hierarchical_cache", False)
+        )
+        if unsupported:
+            raise ValueError(
+                "Tensor-parallel Mamba compression requires DP=1, PP=1 and standard "
+                "autoregressive scheduling without speculation, disaggregation, "
+                "PDMux or hierarchical caching"
+            )
     if getattr(args, "mamba_svd_max_pending", 8) < 1:
         raise ValueError("mamba_svd_max_pending must be positive")
     slots = getattr(args, "mamba_svd_cache_size", None)
