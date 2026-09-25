@@ -61,6 +61,7 @@ class ProductionCompareTests(unittest.TestCase):
                     self.assertEqual(
                         "--mamba-svd-compression" in command, cfg["compression"]
                     )
+                    self.assertNotIn("--context-length", command)
                     kw["stdout"].close()
                     raise RuntimeError("captured")
 
@@ -69,7 +70,11 @@ class ProductionCompareTests(unittest.TestCase):
                         asyncio.run(
                             spark_run.one_run(
                                 args,
-                                {**cfg, "production_defaults": True},
+                                {
+                                    **cfg,
+                                    "production_defaults": True,
+                                    "context_length": None,
+                                },
                                 0,
                                 Path(temp) / cfg["label"],
                                 [],

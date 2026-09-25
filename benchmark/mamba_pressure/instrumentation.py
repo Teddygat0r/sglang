@@ -9,6 +9,7 @@ def install():
     import torch
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+    from sglang.srt.server_args import get_global_server_args
 
     if getattr(MambaRadixCache, "_pressure_instrumented", False):
         return
@@ -163,6 +164,10 @@ def install():
         if admission is not None:
             metrics.update(admission.metrics())
         metrics.update(
+            mamba_extra_buffer=tree.enable_mamba_extra_buffer,
+            mamba_track_interval=get_global_server_args().mamba_track_interval,
+            mamba_cache_chunk_size=get_global_server_args().mamba_cache_chunk_size,
+            max_running_requests=scheduler.max_running_requests,
             svd_worker_batch=tree.svd_worker_batch
             if tree.enable_svd_compression
             else 0,

@@ -10,10 +10,11 @@ benchmark server entrypoints.
 | `production_compare.py` | Paired compression off/on under a matched cache ceiling |
 | `sharegpt_sweep.py` | First-turn ShareGPT workload with a roomy cache |
 | `sharegpt_multiturn.py` | Interleaved conversations with reusable input prefixes |
+| `sharegpt_pressure.py` | Ten-turn unsplit ShareGPT replay, concurrency 8, constrained cache budget |
 | `tail_compare.py` | Eager versus default compression, with profiled and unprofiled controls |
 
 The shared runner, allocation/reporting helpers, observation hooks and profiling
-analysis support these four entrypoints. Historical allocation sweeps, policy
+analysis support these entrypoints. Historical allocation sweeps, policy
 monkey-patches, one-off scripts, generated reports and raw results are archived
 outside the checkout. Registered application tests own the former benchmark
 regression wrappers' coverage.

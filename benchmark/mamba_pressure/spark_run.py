@@ -74,7 +74,7 @@ async def request(session, base, tokens, output):
         "start_ns": start_ns,
         "first_ns": start_ns + int((first - start) * 1e9),
         "ttft_ms": (first - start) * 1000,
-        "tpot_ms": (last - first) * 1000 / (output - 1),
+        "tpot_ms": (last - first) * 1000 / (output - 1) if output > 1 else 0.0,
         "latency_ms": (time.perf_counter() - start) * 1000,
         "input_tokens": len(tokens),
         "output_tokens": last_count,
@@ -145,7 +145,38 @@ def summarize_requests(rows, duration, before, after, args):
         "compression_committed": delta("compression_committed"),
         "compression_failed": delta("compression_failed"),
         "decompression_hits": delta("decompression_hits"),
+        "retractions": sum(
+            r.get("meta_info", {}).get("total_retractions", 0) for r in rows
+        ),
     }
+
+
+async def replay_causal_sessions(workload, concurrency, execute):
+    """Closed-loop replay without cross-conversation turn barriers."""
+    groups = {}
+    for index, item in enumerate(workload):
+        group = groups.setdefault(item["group"], [])
+        if item["round"] != len(group):
+            raise ValueError("Conversation turns must be contiguous and causal")
+        group.append((index, item))
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def conversation(items):
+        for index, item in items:
+            async with semaphore:
+                await execute(index, item)
+
+    await asyncio.gather(*(conversation(items) for items in groups.values()))
+
+
+def validate_checkpoint_config(initial, config, concurrency):
+    if config.get("mamba_scheduler_strategy") == "extra_buffer":
+        if not initial.get("mamba_extra_buffer"):
+            raise RuntimeError("Required extra_buffer checkpointing is inactive")
+        if initial.get("mamba_track_interval") != config["mamba_track_interval"]:
+            raise RuntimeError("Mamba tracking interval differs from protocol")
+        if initial.get("max_running_requests") != concurrency:
+            raise RuntimeError("Effective request concurrency differs from protocol")
 
 
 async def one_run(args, config, rep, directory, workload, discover=False):
@@ -205,8 +236,6 @@ async def one_run(args, config, rep, directory, workload, discover=False):
         str(config["kv_tokens"]),
         "--max-mamba-cache-size",
         str(config["full_slots"]),
-        "--context-length",
-        "4096",
         "--chunked-prefill-size",
         "2048",
         "--disable-cuda-graph",
@@ -216,6 +245,11 @@ async def one_run(args, config, rep, directory, workload, discover=False):
         "--random-seed",
         str(args.seed + rep),
     ]
+    if config.get("context_length", 4096) is not None:
+        command += ["--context-length", str(config.get("context_length", 4096))]
+    if "mamba_scheduler_strategy" in config:
+        command += ["--mamba-scheduler-strategy", config["mamba_scheduler_strategy"]]
+        command += ["--mamba-track-interval", str(config["mamba_track_interval"])]
     if config["compression"]:
         command += ["--mamba-svd-compression", "--mamba-svd-rank", "16"]
         if not production_defaults:
@@ -268,7 +302,8 @@ async def one_run(args, config, rep, directory, workload, discover=False):
         start_new_session=True,
     )
     save(directory / "pid.json", {"pid": process.pid})
-    timeout = aiohttp.ClientTimeout(total=600)
+    # Long recorded replies and untruncated contexts can legitimately take longer.
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=600)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             deadline = time.monotonic() + 600
@@ -290,6 +325,7 @@ async def one_run(args, config, rep, directory, workload, discover=False):
                 await asyncio.sleep(2)
             initial = await observe(session, base)
             save(directory / "initial.json", initial)
+            validate_checkpoint_config(initial, config, args.concurrency)
             expected_deferral = bool(production_defaults and config["compression"])
             if bool(initial.get("defer_prefill")) != expected_deferral:
                 raise RuntimeError("Prefill deferral mode differs from protocol")
@@ -349,36 +385,38 @@ async def one_run(args, config, rep, directory, workload, discover=False):
             # included in whole-run throughput. Same cadence in both modes.
             start = time.perf_counter()
             with (directory / "requests.jsonl").open("w") as raw:
-                for round_index in range(args.rounds):
-                    semaphore = asyncio.Semaphore(args.concurrency)
 
-                    async def execute(index, item):
-                        async with semaphore:
-                            result = await request(
-                                session,
-                                base,
-                                item["tokens"],
-                                item.get("output", args.output),
-                            )
-                            result.update(
-                                group=item["group"], round=item["round"], index=index
-                            )
-                            rows.append(result)
-                            raw.write(json.dumps(result) + "\n")
-                            raw.flush()
-
-                    items = [
-                        (i, item)
-                        for i, item in enumerate(workload)
-                        if item["round"] == round_index
-                    ]
-                    await asyncio.gather(*(execute(i, item) for i, item in items))
-                    metrics = await observe(session, base)
-                    save(directory / f"round_{round_index}_telemetry.json", metrics)
-                    print(
-                        f"{directory.name}: {len(rows)}/{len(workload)} requests, evictions={metrics.get('evicted_entries', 0)}",
-                        flush=True,
+                async def execute(index, item):
+                    result = await request(
+                        session, base, item["tokens"], item.get("output", args.output)
                     )
+                    result.update(group=item["group"], round=item["round"], index=index)
+                    rows.append(result)
+                    raw.write(json.dumps(result) + "\n")
+                    raw.flush()
+
+                if config.get("replay_schedule") == "causal_sessions":
+                    await replay_causal_sessions(workload, args.concurrency, execute)
+                else:
+                    for round_index in range(args.rounds):
+                        semaphore = asyncio.Semaphore(args.concurrency)
+
+                        async def limited(index, item):
+                            async with semaphore:
+                                await execute(index, item)
+
+                        items = [
+                            (i, item)
+                            for i, item in enumerate(workload)
+                            if item["round"] == round_index
+                        ]
+                        await asyncio.gather(*(limited(i, item) for i, item in items))
+                        metrics = await observe(session, base)
+                        save(directory / f"round_{round_index}_telemetry.json", metrics)
+                        print(
+                            f"{directory.name}: {len(rows)}/{len(workload)} requests, evictions={metrics.get('evicted_entries', 0)}",
+                            flush=True,
+                        )
             duration = time.perf_counter() - start
             after = await observe(session, base)
             save(directory / "after.json", after)
@@ -401,9 +439,11 @@ async def one_run(args, config, rep, directory, workload, discover=False):
                     for i, item in enumerate(workload)
                 )
                 followups = [r for r in rows if r["round"] > 0]
-                metrics["followup_hit_request_fraction"] = sum(
-                    r["cached_tokens"] > 0 for r in followups
-                ) / len(followups)
+                metrics["followup_hit_request_fraction"] = (
+                    sum(r["cached_tokens"] > 0 for r in followups) / len(followups)
+                    if followups
+                    else 0.0
+                )
             if config.get("workload_kind") == "sharegpt_first_turn":
                 # This workload has no declared repeated prefix to recompute.
                 metrics.pop("recomputed_prefix_tokens")
@@ -428,10 +468,11 @@ async def one_run(args, config, rep, directory, workload, discover=False):
                 if not config["compression"]
                 and not getattr(args, "pilot", False)
                 and not config.get("require_no_evictions")
+                and config.get("require_baseline_eviction", True)
                 else None,
-                "no_retractions": all(
-                    r["meta_info"]["total_retractions"] == 0 for r in rows
-                ),
+                "no_retractions": None
+                if config.get("allow_retractions")
+                else all(r["meta_info"]["total_retractions"] == 0 for r in rows),
                 "staging_within_reserve": after.get("staging_peak_bytes", 0)
                 <= config["staging_reserve_bytes"],
                 "expected_compressed_pool": initial["compressed_pool_bytes"]
@@ -457,7 +498,14 @@ async def one_run(args, config, rep, directory, workload, discover=False):
                     metrics["evicted_entries"] == 0
                     and metrics["evicted_kv_tokens"] == 0
                 )
-            if config.get("workload_kind") == "sharegpt_multiturn":
+            if (
+                config.get("workload_kind") == "sharegpt_multiturn"
+                and config.get("require_prefix_reuse", True)
+                and (
+                    not config.get("prefix_reuse_pilot_only")
+                    or getattr(args, "pilot", False)
+                )
+            ):
                 validation["shared_prefix_reuse_observed"] = (
                     metrics["token_cache_hit_rate"] >= 0.10
                 )
